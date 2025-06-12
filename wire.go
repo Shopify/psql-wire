@@ -85,6 +85,7 @@ func NewServer(parse ParseFn, options ...OptionFn) (*Server, error) {
 		parse:      parse,
 		logger:     slog.Default(),
 		closer:     make(chan struct{}),
+		started:    make(chan struct{}),
 		types:      pgtype.NewMap(),
 		Statements: DefaultStatementCacheFn,
 		Portals:    DefaultPortalCacheFn,
@@ -105,6 +106,7 @@ func NewServer(parse ParseFn, options ...OptionFn) (*Server, error) {
 type Server struct {
 	closing         atomic.Bool
 	wg              sync.WaitGroup
+	started         chan struct{}
 	logger          *slog.Logger
 	types           *pgtype.Map
 	Auth            AuthStrategy
@@ -146,6 +148,9 @@ func (srv *Server) Serve(listener net.Listener) error {
 		srv.logger.Info("serving incoming connections", slog.String("addr", listener.Addr().String()))
 	}
 	srv.wg.Add(1)
+	
+	// Signal that server has started accepting connections
+	close(srv.started)
 
 	// NOTE: handle graceful shutdowns
 	go func() {
@@ -168,6 +173,12 @@ func (srv *Server) Serve(listener net.Listener) error {
 			return err
 		}
 
+		// Check if we're already closing before accepting new connections
+		if srv.closing.Load() {
+			_ = conn.Close()
+			continue
+		}
+		
 		srv.wg.Add(1)
 		go func() {
 			defer srv.wg.Done()
@@ -246,12 +257,20 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 
 // Close gracefully closes the underlaying Postgres server.
 func (srv *Server) Close() error {
-	if srv.closing.Load() {
-		return nil
+	if !srv.closing.CompareAndSwap(false, true) {
+		return nil // Already closing
 	}
 
-	srv.closing.Store(true)
 	close(srv.closer)
+	
+	// Wait for server to start before waiting for graceful shutdown
+	select {
+	case <-srv.started:
+		// Server has started, proceed with graceful shutdown
+	default:
+		// Server hasn't started yet, no need to wait
+		return nil
+	}
 	
 	// Graceful shutdown with 1-second timeout
 	done := make(chan struct{})
