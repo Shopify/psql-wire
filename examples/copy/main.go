@@ -12,7 +12,9 @@ import (
 
 func main() {
 	log.Println("PostgreSQL server is up and running at [127.0.0.1:5432]")
-	wire.ListenAndServe("127.0.0.1:5432", handler)
+	if err := wire.ListenAndServe("127.0.0.1:5432", handler); err != nil {
+		log.Fatal(err)
+	}
 }
 
 var table = wire.Columns{

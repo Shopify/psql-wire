@@ -15,3 +15,7 @@ commands:
     run: go test -v -race -cover ./...
   style:
     run: golangci-lint run --fix ./...
+  lint:
+    run: golangci-lint run
+  format:
+    run: golangci-lint run --fix

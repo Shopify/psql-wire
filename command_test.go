@@ -100,7 +100,7 @@ func TestBindMessageParameters(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		defer conn.Close(ctx)
+		defer func() { _ = conn.Close(ctx) }()
 
 		rows, err := conn.Query(ctx, "SELECT $1 $2;", "John Doe", 42)
 		if err != nil {

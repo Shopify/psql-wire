@@ -16,7 +16,9 @@ func main() {
 	}
 
 	log.Println("PostgreSQL server is up and running at [127.0.0.1:5432]")
-	srv.ListenAndServe("127.0.0.1:5432")
+	if err := srv.ListenAndServe("127.0.0.1:5432"); err != nil {
+		log.Fatal(err)
+	}
 }
 
 type key int

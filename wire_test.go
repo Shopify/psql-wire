@@ -304,7 +304,7 @@ func TestServerHandlingMultipleConnections(t *testing.T) {
 		rows, err := conn.Query("select age from person")
 		require.NoError(t, err)
 		t.Cleanup(func() {
-			rows.Close()
+			_ = rows.Close()
 		})
 		assert.True(t, rows.Next())
 		require.NoError(t, rows.Err())
@@ -321,12 +321,12 @@ func TestServerHandlingMultipleConnections(t *testing.T) {
 				stmt, err := conn.Prepare(query)
 				require.NoError(t, err)
 				t.Cleanup(func() {
-					stmt.Close()
+					_ = stmt.Close()
 				})
 				rows, err := stmt.Query(1)
 				require.NoError(t, err)
 				t.Cleanup(func() {
-					rows.Close()
+					_ = rows.Close()
 				})
 				require.True(t, rows.Next())
 				require.NoError(t, rows.Err())
