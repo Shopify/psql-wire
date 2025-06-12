@@ -85,7 +85,7 @@ func TestRaceCloseBeforeServe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	done := make(chan error, 1)
 	go func() {

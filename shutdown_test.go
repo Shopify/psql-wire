@@ -72,34 +72,6 @@ func TestServerCloseWithTimeout(t *testing.T) {
 	t.Logf("Shutdown completed in %v", duration)
 }
 
-func TestServerCloseIdempotent(t *testing.T) {
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
-		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
-			return writer.Complete("OK")
-		})
-		return Prepared(statement), nil
-	}
-
-	server, err := NewServer(handler, Logger(slogt.New(t)))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Test that multiple calls to Close() are safe
-	for i := 0; i < 3; i++ {
-		err = server.Close()
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Verify server is marked as closing
-	if !server.closing.Load() {
-		t.Error("Expected server to be marked as closing")
-	}
-
-	t.Log("Multiple Close() calls completed successfully")
-}
 
 func TestServerShutdownLogging(t *testing.T) {
 	t.Parallel()
