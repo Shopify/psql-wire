@@ -10,6 +10,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
@@ -167,7 +168,10 @@ func (srv *Server) Serve(listener net.Listener) error {
 			return err
 		}
 
+		srv.wg.Add(1)
 		go func() {
+			defer srv.wg.Done()
+			
 			ctx := context.Background()
 			err = srv.serve(ctx, conn)
 			if err != nil && err != io.EOF && srv.logger != nil && !srv.closing.Load() {
@@ -180,7 +184,7 @@ func (srv *Server) Serve(listener net.Listener) error {
 func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 	ctx = setTypeInfo(ctx, srv.types)
 	ctx = setRemoteAddress(ctx, conn.RemoteAddr())
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if srv.logger != nil {
 		srv.logger.Debug("serving a new client connection")
@@ -248,6 +252,23 @@ func (srv *Server) Close() error {
 
 	srv.closing.Store(true)
 	close(srv.closer)
-	srv.wg.Wait()
-	return nil
+	
+	// Graceful shutdown with 1-second timeout
+	done := make(chan struct{})
+	go func() {
+		srv.wg.Wait()
+		close(done)
+	}()
+	
+	select {
+	case <-done:
+		// All connections closed gracefully
+		return nil
+	case <-time.After(1 * time.Second):
+		// Timeout reached, force close
+		if srv.logger != nil {
+			srv.logger.Info("graceful shutdown timeout reached, forcing close")
+		}
+		return nil
+	}
 }
