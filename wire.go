@@ -10,6 +10,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
@@ -84,6 +85,7 @@ func NewServer(parse ParseFn, options ...OptionFn) (*Server, error) {
 		parse:      parse,
 		logger:     slog.Default(),
 		closer:     make(chan struct{}),
+		started:    make(chan struct{}),
 		types:      pgtype.NewMap(),
 		Statements: DefaultStatementCacheFn,
 		Portals:    DefaultPortalCacheFn,
@@ -104,6 +106,7 @@ func NewServer(parse ParseFn, options ...OptionFn) (*Server, error) {
 type Server struct {
 	closing         atomic.Bool
 	wg              sync.WaitGroup
+	started         chan struct{}
 	logger          *slog.Logger
 	types           *pgtype.Map
 	Auth            AuthStrategy
@@ -135,10 +138,19 @@ func (srv *Server) ListenAndServe(address string) error {
 // preconfigured configurations. The given listener will be closed once the
 // server is gracefully closed.
 func (srv *Server) Serve(listener net.Listener) error {
-	defer srv.logger.Info("closing server")
+	defer func() {
+		if srv.logger != nil && !srv.closing.Load() {
+			srv.logger.Info("closing server")
+		}
+	}()
 
-	srv.logger.Info("serving incoming connections", slog.String("addr", listener.Addr().String()))
+	if srv.logger != nil {
+		srv.logger.Info("serving incoming connections", slog.String("addr", listener.Addr().String()))
+	}
 	srv.wg.Add(1)
+	
+	// Signal that server has started accepting connections
+	close(srv.started)
 
 	// NOTE: handle graceful shutdowns
 	go func() {
@@ -146,7 +158,7 @@ func (srv *Server) Serve(listener net.Listener) error {
 		<-srv.closer
 
 		err := listener.Close()
-		if err != nil {
+		if err != nil && srv.logger != nil && !srv.closing.Load() {
 			srv.logger.Error("unexpected error while attempting to close the net listener", "err", err)
 		}
 	}()
@@ -161,10 +173,19 @@ func (srv *Server) Serve(listener net.Listener) error {
 			return err
 		}
 
+		// Check if we're already closing before accepting new connections
+		if srv.closing.Load() {
+			_ = conn.Close()
+			continue
+		}
+		
+		srv.wg.Add(1)
 		go func() {
+			defer srv.wg.Done()
+			
 			ctx := context.Background()
 			err = srv.serve(ctx, conn)
-			if err != nil && err != io.EOF {
+			if err != nil && err != io.EOF && srv.logger != nil && !srv.closing.Load() {
 				srv.logger.Error("an unexpected error got returned while serving a client connection", "err", err)
 			}
 		}()
@@ -174,9 +195,11 @@ func (srv *Server) Serve(listener net.Listener) error {
 func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 	ctx = setTypeInfo(ctx, srv.types)
 	ctx = setRemoteAddress(ctx, conn.RemoteAddr())
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
-	srv.logger.Debug("serving a new client connection")
+	if srv.logger != nil {
+		srv.logger.Debug("serving a new client connection")
+	}
 
 	conn, version, reader, err := srv.Handshake(conn)
 	if err != nil {
@@ -187,9 +210,15 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 		return conn.Close()
 	}
 
-	srv.logger.Debug("handshake successfull, validating authentication")
+	if srv.logger != nil {
+		srv.logger.Debug("handshake successfull, validating authentication")
+	}
 
-	writer := buffer.NewWriter(srv.logger, conn)
+	logger := srv.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	writer := buffer.NewWriter(logger, conn)
 	ctx, err = srv.readClientParameters(ctx, reader)
 	if err != nil {
 		return err
@@ -200,7 +229,9 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 		return err
 	}
 
-	srv.logger.Debug("connection authenticated, writing server parameters")
+	if srv.logger != nil {
+		srv.logger.Debug("connection authenticated, writing server parameters")
+	}
 
 	ctx, err = srv.writeParameters(ctx, writer, srv.Parameters)
 	if err != nil {
@@ -226,12 +257,37 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 
 // Close gracefully closes the underlaying Postgres server.
 func (srv *Server) Close() error {
-	if srv.closing.Load() {
-		return nil
+	if !srv.closing.CompareAndSwap(false, true) {
+		return nil // Already closing
 	}
 
-	srv.closing.Store(true)
 	close(srv.closer)
-	srv.wg.Wait()
-	return nil
+	
+	// Wait for server to start before waiting for graceful shutdown
+	select {
+	case <-srv.started:
+		// Server has started, proceed with graceful shutdown
+	default:
+		// Server hasn't started yet, no need to wait
+		return nil
+	}
+	
+	// Graceful shutdown with 1-second timeout
+	done := make(chan struct{})
+	go func() {
+		srv.wg.Wait()
+		close(done)
+	}()
+	
+	select {
+	case <-done:
+		// All connections closed gracefully
+		return nil
+	case <-time.After(1 * time.Second):
+		// Timeout reached, force close
+		if srv.logger != nil {
+			srv.logger.Info("graceful shutdown timeout reached, forcing close")
+		}
+		return nil
+	}
 }
