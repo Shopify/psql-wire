@@ -72,6 +72,8 @@ func (srv *Session) consumeCommands(ctx context.Context, conn net.Conn, reader *
 		return err
 	}
 
+	defer srv.Close()
+
 	for {
 		if err = srv.consumeSingleCommand(ctx, reader, writer, conn); err != nil {
 			return err
@@ -197,9 +199,6 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 	case types.ClientBind:
 		return srv.handleBind(ctx, reader, writer)
 	case types.ClientFlush:
-		// TODO: Flush all remaining rows inside connection buffer if
-		// any are remaining.
-		//
 		// The Flush message does not cause any specific
 		// output to be generated, but forces the backend to deliver any data
 		// pending in its output buffers. A Flush must be sent after any
@@ -208,6 +207,10 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 		// Flush, messages returned by the backend will be combined into the
 		// minimum possible number of packets to minimize network overhead.
 		// https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
+		if srv.FlushConn != nil {
+			return srv.FlushConn(ctx)
+		}
+
 		return nil
 	case types.ClientCopyData, types.ClientCopyDone, types.ClientCopyFail:
 		// We're supposed to ignore these messages, per the protocol spec. This
@@ -217,7 +220,6 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 		// https://github.com/postgres/postgres/blob/6e1dd2773eb60a6ab87b27b8d9391b756e904ac3/src/backend/tcop/postgres.c#L4295
 		return nil
 	case types.ClientClose:
-		// TODO: close the statement or portal
 		writer.Start(types.ServerCloseComplete) //nolint:errcheck
 		writer.End()                            //nolint:errcheck
 		return nil
@@ -280,7 +282,7 @@ func (srv *Session) handleSimpleQuery(ctx context.Context, reader *buffer.Reader
 			return ErrorCode(writer, err)
 		}
 
-		err = statements[index].fn(ctx, NewDataWriter(ctx, statements[index].columns, nil, reader, writer), nil)
+		err = statements[index].fn(ctx, NewDataWriter(ctx, statements[index].columns, nil, NoLimit, reader, writer), nil)
 		if err != nil {
 			return ErrorCode(writer, err)
 		}
@@ -495,7 +497,7 @@ func (srv *Session) readParameters(ctx context.Context, reader *buffer.Reader) (
 
 	parameters := make([]Parameter, length)
 	for i := 0; i < int(length); i++ {
-		length, err := reader.GetUint32()
+		length, err := reader.GetInt32()
 		if err != nil {
 			return nil, err
 		}
@@ -549,9 +551,7 @@ func (srv *Session) handleExecute(ctx context.Context, reader *buffer.Reader, wr
 		return err
 	}
 
-	// TODO: Limit the maximum number of records to be returned.
-	//
-	// Maximum number of limit to return, if portal contains a
+	// NOTE: maximum number of limit to return, if portal contains a
 	// query that returns limit (ignored otherwise). Zero denotes “no limit”.
 	limit, err := reader.GetUint32()
 	if err != nil {
@@ -559,7 +559,7 @@ func (srv *Session) handleExecute(ctx context.Context, reader *buffer.Reader, wr
 	}
 
 	srv.logger.Debug("executing", slog.String("name", name), slog.Uint64("limit", uint64(limit)))
-	err = srv.Portals.Execute(ctx, name, reader, writer)
+	err = srv.Portals.Execute(ctx, name, Limit(limit), reader, writer)
 	if err != nil {
 		return ErrorCode(writer, err)
 	}
@@ -589,4 +589,9 @@ func singleStatement(stmts PreparedStatements, err error) (*PreparedStatement, e
 	}
 
 	return stmts[0], nil
+}
+
+func (srv *Session) Close() {
+	srv.Statements.Close()
+	srv.Portals.Close()
 }

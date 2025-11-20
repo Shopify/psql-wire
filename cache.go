@@ -61,6 +61,8 @@ func (cache *DefaultStatementCache) Get(ctx context.Context, name string) (*Stat
 	return stmt, nil
 }
 
+func (cache *DefaultStatementCache) Close() {}
+
 type Portal struct {
 	statement  *Statement
 	parameters []Parameter
@@ -109,7 +111,7 @@ func (cache *DefaultPortalCache) Get(ctx context.Context, name string) (*Portal,
 	return portal, nil
 }
 
-func (cache *DefaultPortalCache) Execute(ctx context.Context, name string, reader *buffer.Reader, writer *buffer.Writer) (err error) {
+func (cache *DefaultPortalCache) Execute(ctx context.Context, name string, limit Limit, reader *buffer.Reader, writer *buffer.Writer) (err error) {
 	defer func() {
 		r := recover()
 		if r != nil {
@@ -129,5 +131,7 @@ func (cache *DefaultPortalCache) Execute(ctx context.Context, name string, reade
 		return nil
 	}
 
-	return portal.statement.fn(ctx, NewDataWriter(ctx, portal.statement.columns, portal.formats, reader, writer), portal.parameters)
+	return portal.statement.fn(ctx, NewDataWriter(ctx, portal.statement.columns, portal.formats, limit, reader, writer), portal.parameters)
 }
+
+func (cache *DefaultPortalCache) Close() {}

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strconv"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
@@ -85,17 +86,35 @@ type StatementCache interface {
 	// Get attempts to get the prepared statement for the given name. An error
 	// is returned when no statement has been found.
 	Get(ctx context.Context, name string) (*Statement, error)
+	// Close is called at the end of a connection. Close releases all resources
+	// held by the statement cache.
+	Close()
 }
 
 // PortalCache represents a cache which could be used to bind and execute
 // prepared statements with parameters.
 type PortalCache interface {
+	// Bind attempts to bind the given statement to the given name. Any
+	// previously defined statement is overridden.
 	Bind(ctx context.Context, name string, statement *Statement, parameters []Parameter, columns []FormatCode) error
+	// Get attempts to get the portal for the given name. An error is returned
+	// when no portal has been found.
 	Get(ctx context.Context, name string) (*Portal, error)
-	Execute(ctx context.Context, name string, reader *buffer.Reader, writer *buffer.Writer) error
+	// Execute executes the prepared statement with the given name and parameters.
+	Execute(ctx context.Context, name string, limit Limit, reader *buffer.Reader, writer *buffer.Writer) error
+	// Close is called at the end of a connection. Close releases all resources
+	// held by the portal cache.
+	Close()
 }
 
+type FlushFn func(ctx context.Context) error
+
 type CloseFn func(ctx context.Context) error
+
+// CancelRequestFn function called when a cancel request is received.
+// The function receives the process ID and secret key from the cancel request.
+// It should return an error if the cancel request cannot be processed.
+type CancelRequestFn func(ctx context.Context, processID int32, secretKey int32) error
 
 // OptionFn options pattern used to define and set options for the given
 // PostgreSQL server.
@@ -135,12 +154,37 @@ func TerminateConn(fn CloseFn) OptionFn {
 	}
 }
 
+// FlushConn registers a handler for Flush messages.
+//
+// The provided handler is invoked when the frontend sends a Flush command.
+// This allows the server to force any pending data in its output buffers
+// to be delivered immediately.
+//
+// Typically, a Flush is sent after an extended-query command (except Sync)
+// when the frontend wants to inspect results before issuing more commands.
+func FlushConn(fn FlushFn) OptionFn {
+	return func(srv *Server) error {
+		srv.FlushConn = fn
+		return nil
+	}
+}
+
 // MessageBufferSize sets the message buffer size which is allocated once a new
 // connection gets constructed. If a negative value or zero value is provided is
 // the default message buffer size used.
 func MessageBufferSize(size int) OptionFn {
 	return func(srv *Server) error {
 		srv.BufferedMsgSize = size
+		return nil
+	}
+}
+
+// ClientAuth sets the client authentication type which is used to authenticate
+// the client connection. The default value is [tls.NoClientCert] which means
+// that no client authentication is performed.
+func ClientAuth(auth tls.ClientAuthType) OptionFn {
+	return func(srv *Server) error {
+		srv.ClientAuth = auth
 		return nil
 	}
 }
@@ -159,6 +203,26 @@ func TLSConfig(config *tls.Config) OptionFn {
 func SessionAuthStrategy(fn AuthStrategy) OptionFn {
 	return func(srv *Server) error {
 		srv.Auth = fn
+		return nil
+	}
+}
+
+// BackendKeyData sets the function that generates backend key data for query cancellation.
+// The provided function should return a process ID and secret key that can be used by
+// clients to cancel queries. If not set, no BackendKeyData message will be sent.
+func BackendKeyData(fn BackendKeyDataFunc) OptionFn {
+	return func(srv *Server) error {
+		srv.BackendKeyData = fn
+		return nil
+	}
+}
+
+// CancelRequest sets the cancel request handler for the server.
+// This function is called when a client sends a cancel request with a process ID and secret key.
+// The handler should validate the credentials and cancel the appropriate query if valid.
+func CancelRequest(fn CancelRequestFn) OptionFn {
+	return func(srv *Server) error {
+		srv.CancelRequest = fn
 		return nil
 	}
 }
@@ -189,12 +253,23 @@ func Version(version string) OptionFn {
 	}
 }
 
+// WithShutdownTimeout sets the timeout duration for graceful shutdown.
+// When Shutdown is called, the server will wait up to this duration for
+// active connections to finish before forcing closure.
+// A timeout of 0 means wait indefinitely (no timeout).
+func WithShutdownTimeout(timeout time.Duration) OptionFn {
+	return func(srv *Server) error {
+		srv.ShutdownTimeout = timeout
+		return nil
+	}
+}
+
 // ExtendTypes provides the ability to extend the underlying connection types.
 // Types registered inside the given [github.com/jackc/pgx/v5/pgtype.Map] are
 // registered to all incoming connections.
 func ExtendTypes(fn func(*pgtype.Map)) OptionFn {
 	return func(srv *Server) error {
-		fn(srv.types)
+		srv.typeExtension = fn
 		return nil
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net"
@@ -21,10 +22,6 @@ func (srv *Server) Handshake(conn net.Conn) (_ net.Conn, version types.Version, 
 		return conn, version, reader, err
 	}
 
-	if version == types.VersionCancel {
-		return conn, version, reader, nil
-	}
-
 	// TODO: support GSS encryption
 	//
 	// `psql-wire` currently does not support GSS encrypted connections. The GSS
@@ -36,6 +33,27 @@ func (srv *Server) Handshake(conn net.Conn) (_ net.Conn, version types.Version, 
 	conn, reader, version, err = srv.potentialConnUpgrade(conn, reader, version)
 	if err != nil {
 		return conn, version, reader, err
+	}
+
+	if version == types.VersionCancel {
+		processID, secretKey, err := srv.readCancelRequest(reader)
+		if err != nil {
+			return conn, version, reader, err
+		}
+
+		srv.logger.Debug("Received cancel request")
+
+		if srv.CancelRequest != nil {
+			ctx := context.Background()
+			err = srv.CancelRequest(ctx, processID, secretKey)
+			if err != nil {
+				srv.logger.Error("Failed to handle cancel request", "err", err)
+			}
+		} else {
+			srv.logger.Debug("Cancel request received but no handler configured")
+		}
+
+		return conn, version, reader, nil
 	}
 
 	return conn, version, reader, nil
@@ -56,6 +74,28 @@ func (srv *Server) readVersion(reader *buffer.Reader) (_ types.Version, err erro
 	}
 
 	return types.Version(version), nil
+}
+
+// readCancelRequest reads the cancel request parameters (processID and secretKey)
+// from the client connection. The full cancel request format is:
+// Int32(16) - Length of message contents in bytes, including self
+// Int32(80877102) - The cancel request code (already read as version)
+// Int32 - The process ID of the target backend
+// Int32 - The secret key for the target backend
+// The first two fields are already handled by readVersion, so this only needs
+// to read the last two fields.
+func (srv *Server) readCancelRequest(reader *buffer.Reader) (processID int32, secretKey int32, err error) {
+	processID, err = reader.GetInt32()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to read process ID from cancel request: %w", err)
+	}
+
+	secretKey, err = reader.GetInt32()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to read secret key from cancel request: %w", err)
+	}
+
+	return processID, secretKey, nil
 }
 
 // readyForQuery indicates that the server is ready to receive queries.
@@ -118,6 +158,7 @@ func (srv *Server) writeParameters(ctx context.Context, writer *buffer.Writer, p
 	}
 	params[ParamIsSuperuser] = buffer.EncodeBoolean(IsSuperUser(ctx))
 	params[ParamSessionAuthorization] = AuthenticatedUsername(ctx)
+	params[ParamServerVersion] = fmt.Sprintf("%d", 15*10000) // 15.1.2 => 15*10000 + 1*100 + 2*1 => 15102
 
 	for key, value := range params {
 		srv.logger.Debug("server parameter", slog.String("key", string(key)), slog.String("value", value))
@@ -141,12 +182,22 @@ func (srv *Server) writeParameters(ctx context.Context, writer *buffer.Writer, p
 // server does not support a secure connection.
 func (srv *Server) potentialConnUpgrade(conn net.Conn, reader *buffer.Reader, version types.Version) (_ net.Conn, _ *buffer.Reader, _ types.Version, err error) {
 	if version != types.VersionSSLRequest {
+		if srv.ClientAuth == tls.RequireAndVerifyClientCert {
+			srv.logger.Warn("client is requesting nil TLS, but the server mandates TLS")
+			return conn, reader, version, fmt.Errorf("client is requesting nil TLS, but the server mandates TLS")
+		}
+
 		return conn, reader, version, nil
 	}
 
 	srv.logger.Debug("attempting to upgrade the client to a TLS connection")
 
 	if srv.TLSConfig == nil || len(srv.TLSConfig.Certificates) == 0 {
+		if srv.ClientAuth == tls.RequireAndVerifyClientCert {
+			srv.logger.Warn("server mandates TLS, but does not possess the requisite certificates")
+			return conn, reader, version, fmt.Errorf("server mandates TLS, but does not possess the requisite certificates")
+		}
+
 		srv.logger.Debug("no TLS certificates available continuing with a insecure connection")
 		return srv.sslUnsupported(conn, reader, version)
 	}

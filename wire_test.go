@@ -5,12 +5,16 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/jeroenrinzema/psql-wire/pkg/mock"
+	"github.com/jeroenrinzema/psql-wire/pkg/types"
 	"github.com/lib/pq"
 	"github.com/lib/pq/oid"
 	"github.com/neilotoole/slogt"
@@ -304,7 +308,7 @@ func TestServerHandlingMultipleConnections(t *testing.T) {
 		rows, err := conn.Query("select age from person")
 		require.NoError(t, err)
 		t.Cleanup(func() {
-			rows.Close()
+			rows.Close() //nolint:errcheck
 		})
 		assert.True(t, rows.Next())
 		require.NoError(t, rows.Err())
@@ -321,12 +325,12 @@ func TestServerHandlingMultipleConnections(t *testing.T) {
 				stmt, err := conn.Prepare(query)
 				require.NoError(t, err)
 				t.Cleanup(func() {
-					stmt.Close()
+					stmt.Close() //nolint:errcheck
 				})
 				rows, err := stmt.Query(1)
 				require.NoError(t, err)
 				t.Cleanup(func() {
-					rows.Close()
+					rows.Close() //nolint:errcheck
 				})
 				require.True(t, rows.Next())
 				require.NoError(t, rows.Err())
@@ -691,4 +695,548 @@ func TestServerCopyIn(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestServerShutdownWithContextDeadline(t *testing.T) {
+	t.Parallel()
+
+	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
+			return writer.Complete("OK")
+		})
+		return Prepared(statement), nil
+	}
+
+	// Create server with a longer shutdown timeout
+	server, err := NewServer(handler,
+		WithShutdownTimeout(5*time.Second),
+		Logger(slogt.New(t)))
+	require.NoError(t, err)
+
+	_ = TListenAndServeWithoutCleanup(t, server)
+
+	// Test shutdown with shorter context deadline (should be used)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err = server.Shutdown(ctx)
+	duration := time.Since(start)
+
+	// Should complete quickly since no active connections
+	assert.NoError(t, err)
+	assert.Less(t, duration, 300*time.Millisecond)
+}
+
+func TestServerShutdownWithServerTimeout(t *testing.T) {
+	t.Parallel()
+
+	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
+			return writer.Complete("OK")
+		})
+		return Prepared(statement), nil
+	}
+
+	// Create server with custom shutdown timeout
+	server, err := NewServer(handler,
+		WithShutdownTimeout(100*time.Millisecond),
+		Logger(slogt.New(t)))
+	require.NoError(t, err)
+
+	_ = TListenAndServeWithoutCleanup(t, server)
+
+	// Test shutdown uses server timeout regardless of context
+	ctx := context.Background()
+	start := time.Now()
+	err = server.Shutdown(ctx)
+	duration := time.Since(start)
+
+	assert.NoError(t, err)
+	assert.Less(t, duration, 200*time.Millisecond)
+}
+
+func TestServerShutdownUsesShortestTimeout(t *testing.T) {
+	t.Parallel()
+
+	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
+			return writer.Complete("OK")
+		})
+		return Prepared(statement), nil
+	}
+
+	// Create server with longer timeout
+	server, err := NewServer(handler,
+		WithShutdownTimeout(1*time.Second),
+		Logger(slogt.New(t)))
+	require.NoError(t, err)
+
+	_ = TListenAndServeWithoutCleanup(t, server)
+
+	// Test with shorter context deadline - should be used instead of server timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err = server.Shutdown(ctx)
+	duration := time.Since(start)
+
+	// Should complete quickly since no active connections
+	// (would take longer if server timeout was used)
+	assert.NoError(t, err)
+	assert.Less(t, duration, 200*time.Millisecond)
+}
+
+func TestServerShutdownShorterTimeoutWins(t *testing.T) {
+	t.Parallel()
+
+	var queryStarted sync.WaitGroup
+	var queryCanFinish sync.WaitGroup
+	queryStarted.Add(1)
+	queryCanFinish.Add(1)
+
+	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
+			queryStarted.Done()
+			queryCanFinish.Wait() // Block until test releases it
+			return writer.Complete("OK")
+		})
+		return Prepared(statement), nil
+	}
+
+	// Create server with longer timeout (1 second)
+	server, err := NewServer(handler,
+		WithShutdownTimeout(1*time.Second),
+		Logger(slogt.New(t)))
+	require.NoError(t, err)
+
+	addr := TListenAndServeWithoutCleanup(t, server)
+
+	// Start a long-running query
+	go func() {
+		conn, err := sql.Open("postgres", fmt.Sprintf("postgres://username:password@%s/database?sslmode=disable", addr))
+		if err != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck
+		_, _ = conn.Exec("SELECT 1")
+	}()
+
+	// Wait for query to start
+	queryStarted.Wait()
+
+	// Test with shorter context deadline - should win over server timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err = server.Shutdown(ctx)
+	duration := time.Since(start)
+
+	// Should timeout after ~80ms (context deadline), not 1s (server timeout)
+	assert.Error(t, err)
+	assert.Equal(t, context.DeadlineExceeded, err)
+	assert.GreaterOrEqual(t, duration, 80*time.Millisecond)
+	assert.Less(t, duration, 200*time.Millisecond)
+
+	// Cleanup
+	queryCanFinish.Done()
+	time.Sleep(10 * time.Millisecond)
+	server.Close() //nolint:errcheck
+}
+
+func TestServerShutdownServerTimeoutWins(t *testing.T) {
+	t.Parallel()
+
+	var queryStarted sync.WaitGroup
+	var queryCanFinish sync.WaitGroup
+	queryStarted.Add(1)
+	queryCanFinish.Add(1)
+
+	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
+			queryStarted.Done()
+			queryCanFinish.Wait() // Block until test releases it
+			return writer.Complete("OK")
+		})
+		return Prepared(statement), nil
+	}
+
+	// Create server with shorter timeout (80ms)
+	server, err := NewServer(handler,
+		WithShutdownTimeout(80*time.Millisecond),
+		Logger(slogt.New(t)))
+	require.NoError(t, err)
+
+	addr := TListenAndServeWithoutCleanup(t, server)
+
+	// Start a long-running query
+	go func() {
+		conn, err := sql.Open("postgres", fmt.Sprintf("postgres://username:password@%s/database?sslmode=disable", addr))
+		if err != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck
+		_, _ = conn.Exec("SELECT 1")
+	}()
+
+	// Wait for query to start
+	queryStarted.Wait()
+
+	// Test with longer context deadline - server timeout should win
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err = server.Shutdown(ctx)
+	duration := time.Since(start)
+
+	// Should timeout after ~80ms (server timeout), not 1s (context deadline)
+	assert.Error(t, err)
+	assert.Equal(t, context.DeadlineExceeded, err)
+	assert.GreaterOrEqual(t, duration, 80*time.Millisecond)
+	assert.Less(t, duration, 200*time.Millisecond)
+
+	// Cleanup
+	queryCanFinish.Done()
+	time.Sleep(10 * time.Millisecond)
+	server.Close() //nolint:errcheck
+}
+
+func TestServerShutdownTimeout(t *testing.T) {
+	t.Parallel()
+
+	var queryStarted sync.WaitGroup
+	var queryCanFinish sync.WaitGroup
+	queryStarted.Add(1)
+	queryCanFinish.Add(1)
+
+	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
+			queryStarted.Done()
+			queryCanFinish.Wait() // Block until test releases it
+			return writer.Complete("OK")
+		})
+		return Prepared(statement), nil
+	}
+
+	// Create server with very short shutdown timeout
+	server, err := NewServer(handler,
+		WithShutdownTimeout(50*time.Millisecond),
+		Logger(slogt.New(t)))
+	require.NoError(t, err)
+
+	addr := TListenAndServeWithoutCleanup(t, server)
+
+	// Start a long-running query in background
+	go func() {
+		conn, err := sql.Open("postgres", fmt.Sprintf("postgres://username:password@%s/database?sslmode=disable", addr))
+		if err != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck
+		_, _ = conn.Exec("SELECT 1")
+	}()
+
+	// Wait for query to start
+	queryStarted.Wait()
+
+	// Test shutdown will timeout because query is still running
+	ctx := context.Background()
+	start := time.Now()
+	err = server.Shutdown(ctx)
+	duration := time.Since(start)
+
+	// Should timeout because query is still running
+	assert.Error(t, err)
+	assert.Equal(t, context.DeadlineExceeded, err)
+	assert.GreaterOrEqual(t, duration, 50*time.Millisecond)
+	assert.Less(t, duration, 150*time.Millisecond)
+
+	// Allow query to finish and cleanup
+	queryCanFinish.Done()
+	time.Sleep(10 * time.Millisecond)
+	server.Close() //nolint:errcheck
+}
+
+func TestServerShutdownConcurrent(t *testing.T) {
+	t.Parallel()
+
+	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
+			return writer.Complete("OK")
+		})
+		return Prepared(statement), nil
+	}
+
+	server, err := NewServer(handler, Logger(slogt.New(t)))
+	require.NoError(t, err)
+
+	TListenAndServeWithoutCleanup(t, server)
+
+	// Test concurrent shutdown calls
+	var wg sync.WaitGroup
+	errors := make([]error, 3)
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			errors[index] = server.Shutdown(ctx)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// All shutdown calls should succeed (first one does the work, others are no-ops)
+	for i, err := range errors {
+		assert.NoError(t, err, "Shutdown call %d should not error", i)
+	}
+}
+
+func TestWithShutdownTimeoutOption(t *testing.T) {
+	t.Parallel()
+
+	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
+			return writer.Complete("OK")
+		})
+		return Prepared(statement), nil
+	}
+
+	// Test custom timeout
+	customTimeout := 5 * time.Second
+	server, err := NewServer(handler, WithShutdownTimeout(customTimeout))
+	require.NoError(t, err)
+	assert.Equal(t, customTimeout, server.ShutdownTimeout)
+
+	// Test default timeout (1 second)
+	serverDefault, err := NewServer(handler)
+	require.NoError(t, err)
+	assert.Equal(t, 1*time.Second, serverDefault.ShutdownTimeout)
+}
+
+func TestServerShutdownInfiniteTimeout(t *testing.T) {
+	t.Parallel()
+
+	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
+			return writer.Complete("OK")
+		})
+		return Prepared(statement), nil
+	}
+
+	// Create server and set ShutdownTimeout to 0 to test infinite timeout
+	server, err := NewServer(handler, Logger(slogt.New(t)))
+	require.NoError(t, err)
+	server.ShutdownTimeout = 0 // Zero timeout means wait indefinitely
+
+	TListenAndServeWithoutCleanup(t, server)
+
+	// Test shutdown without context deadline (should wait indefinitely but complete quickly with no active connections)
+	ctx := context.Background()
+	start := time.Now()
+	err = server.Shutdown(ctx)
+	duration := time.Since(start)
+
+	assert.NoError(t, err)
+	assert.Less(t, duration, 100*time.Millisecond) // Should complete quickly with no active connections
+}
+
+func TestServerShutdownInfiniteTimeoutWithActiveConnection(t *testing.T) {
+	t.Parallel()
+
+	var queryStarted sync.WaitGroup
+	var queryCanFinish sync.WaitGroup
+	queryStarted.Add(1)
+	queryCanFinish.Add(1)
+
+	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
+			queryStarted.Done()
+			queryCanFinish.Wait() // Block until test releases it
+			return writer.Complete("OK")
+		})
+		return Prepared(statement), nil
+	}
+
+	// Create server with zero timeout (infinite wait)
+	server, err := NewServer(handler, Logger(slogt.New(t)))
+	require.NoError(t, err)
+	server.ShutdownTimeout = 0 // Zero timeout means wait indefinitely
+
+	addr := TListenAndServeWithoutCleanup(t, server)
+
+	// Start a long-running query in background
+	go func() {
+		conn, err := sql.Open("postgres", fmt.Sprintf("postgres://username:password@%s/database?sslmode=disable", addr))
+		if err != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck
+		_, _ = conn.Exec("SELECT 1")
+	}()
+
+	// Wait for query to start
+	queryStarted.Wait()
+
+	// Start shutdown in background (should wait indefinitely)
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx := context.Background() // No deadline, uses server timeout (0 = infinite)
+		shutdownDone <- server.Shutdown(ctx)
+	}()
+
+	// Verify shutdown doesn't complete immediately
+	select {
+	case <-shutdownDone:
+		t.Error("Shutdown completed too quickly - should wait for active connection")
+	case <-time.After(100 * time.Millisecond):
+		// Good - shutdown is waiting
+	}
+
+	// Allow query to finish
+	queryCanFinish.Done()
+
+	// Now shutdown should complete
+	select {
+	case err := <-shutdownDone:
+		assert.NoError(t, err)
+	case <-time.After(200 * time.Millisecond):
+		t.Error("Shutdown took too long after query finished")
+	}
+}
+
+// testLogHandler captures log messages for testing
+type testLogHandler struct {
+	errorLogs *[]string
+	debugLogs *[]string
+	mu        *sync.Mutex
+}
+
+func (h *testLogHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return true
+}
+
+func (h *testLogHandler) Handle(ctx context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if r.Level >= slog.LevelError {
+		*h.errorLogs = append(*h.errorLogs, r.Message)
+	} else if r.Level == slog.LevelDebug {
+		*h.debugLogs = append(*h.debugLogs, r.Message)
+	}
+	return nil
+}
+
+func (h *testLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return h
+}
+
+func (h *testLogHandler) WithGroup(name string) slog.Handler {
+	return h
+}
+
+// TestClientDisconnectDuringWrite tests that the server handles client disconnections gracefully
+// without logging them as unexpected errors when they occur during result writing.
+func TestClientDisconnectDuringWrite(t *testing.T) {
+	t.Parallel()
+
+	// Capture logs
+	var errorLogs []string
+	var debugLogs []string
+	var mu sync.Mutex
+
+	// WaitGroup to synchronize on broken pipe error
+	var brokenPipeWG sync.WaitGroup
+	brokenPipeWG.Add(1)
+
+	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+		// Handler that writes multiple rows to trigger broken pipe when client disconnects
+		statement := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
+			// Write enough data to fill buffers and ensure we hit the broken pipe
+			for i := 0; i < 1000; i++ {
+				if err := writer.Row([]any{fmt.Sprintf("Row %d with some data to fill buffers", i)}); err != nil {
+					// Signal that we've hit the broken pipe error
+					brokenPipeWG.Done()
+					return err // This will be a broken pipe error after client disconnects
+				}
+			}
+			return writer.Complete("SELECT 1000")
+		}, WithColumns(Columns{{Name: "data", Oid: oid.T_text}}))
+		return Prepared(statement), nil
+	}
+
+	// Create custom logger that captures ERROR and DEBUG logs
+	logHandler := &testLogHandler{
+		errorLogs: &errorLogs,
+		debugLogs: &debugLogs,
+		mu:        &mu,
+	}
+
+	server, err := NewServer(handler, Logger(slog.New(logHandler)))
+	require.NoError(t, err)
+	address := TListenAndServe(t, server)
+
+	// Connect and send query
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", address.IP, address.Port))
+	require.NoError(t, err)
+
+	client := mock.NewClient(t, conn)
+	client.Handshake(t)
+	client.Authenticate(t)
+	client.ReadyForQuery(t)
+
+	// Send query
+	client.Start(types.ClientSimpleQuery)
+	client.AddString("SELECT 1")
+	client.AddNullTerminate()
+	err = client.End()
+	require.NoError(t, err)
+
+	// Close connection immediately to cause broken pipe
+	err = conn.Close()
+	require.NoError(t, err)
+
+	// Wait for the handler to encounter the broken pipe error
+	done := make(chan struct{})
+	go func() {
+		brokenPipeWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Handler encountered the broken pipe error as expected
+	case <-time.After(2 * time.Second):
+		t.Error("Timeout waiting for broken pipe error in handler")
+		return
+	}
+
+	// Check logs
+	mu.Lock()
+	defer mu.Unlock()
+
+	// The test fails if we see the error log about unexpected connection error
+	for _, log := range errorLogs {
+		if log == "an unexpected error got returned while serving a client connection" {
+			t.Errorf("Server logged broken pipe as unexpected error - the fix is not working")
+		}
+	}
+}
+
+// TListenAndServeWithoutCleanup is like TListenAndServe but doesn't register cleanup.
+// Used for tests that need manual control over server shutdown.
+func TListenAndServeWithoutCleanup(t *testing.T, server *Server) *net.TCPAddr {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go server.Serve(listener) //nolint:errcheck
+	return listener.Addr().(*net.TCPAddr)
 }
