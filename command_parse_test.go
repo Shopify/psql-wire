@@ -6,10 +6,10 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
 	"github.com/jeroenrinzema/psql-wire/pkg/mock"
 	"github.com/jeroenrinzema/psql-wire/pkg/types"
-	"github.com/lib/pq/oid"
 	"github.com/neilotoole/slogt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,8 +24,8 @@ func TestHandleParse_ParallelPipeline_Success(t *testing.T) {
 	mockParse := func(ctx context.Context, query string) (PreparedStatements, error) {
 		stmt := NewStatement(
 			func(ctx context.Context, writer DataWriter, parameters []Parameter) error { return nil },
-			WithParameters([]oid.Oid{oid.T_text, oid.T_int4}),
-			WithColumns(Columns{{Name: "id", Oid: oid.T_int4}, {Name: "name", Oid: oid.T_text}}),
+			WithParameters([]uint32{pgtype.TextOID, pgtype.Int4OID}),
+			WithColumns(Columns{{Name: "id", Oid: pgtype.Int4OID}, {Name: "name", Oid: pgtype.TextOID}}),
 		)
 		return PreparedStatements{stmt}, nil
 	}

@@ -10,7 +10,6 @@ import (
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
 	"github.com/jeroenrinzema/psql-wire/pkg/mock"
 	"github.com/jeroenrinzema/psql-wire/pkg/types"
-	"github.com/lib/pq/oid"
 	"github.com/neilotoole/slogt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,9 +32,9 @@ func TestHandleExecute_ParallelPipeline_Success(t *testing.T) {
 				}
 				return writer.Complete("SELECT 1")
 			},
-			WithParameters([]oid.Oid{}),
+			WithParameters([]uint32{}),
 			WithColumns(Columns{
-				{Name: "greeting", Oid: oid.T_text},
+				{Name: "greeting", Oid: pgtype.TextOID},
 			}),
 		)
 		return PreparedStatements{stmt}, nil
@@ -141,9 +140,9 @@ func TestHandleExecute_ParallelPipeline_StatementError(t *testing.T) {
 	stmtErr := errors.New("statement failed")
 	stmt := &Statement{
 		fn:         func(ctx context.Context, writer DataWriter, params []Parameter) error { return stmtErr },
-		parameters: []oid.Oid{},
+		parameters: []uint32{},
 		columns: Columns{
-			{Name: "greeting", Oid: oid.T_text},
+			{Name: "greeting", Oid: pgtype.TextOID},
 		},
 	}
 
@@ -251,9 +250,9 @@ func TestHandleExecute_ParallelPipeline_AsyncPanic(t *testing.T) {
 		fn: func(ctx context.Context, writer DataWriter, params []Parameter) error {
 			panic("boom")
 		},
-		parameters: []oid.Oid{},
+		parameters: []uint32{},
 		columns: Columns{
-			{Name: "greeting", Oid: oid.T_text},
+			{Name: "greeting", Oid: pgtype.TextOID},
 		},
 	}
 
