@@ -15,7 +15,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close(ctx)
+	defer func() { _ = conn.Close(ctx) }()
 
 	// Send 3 queries in a batch (pipelined)
 	batch := &pgx.Batch{}
@@ -35,7 +35,9 @@ func main() {
 			log.Printf("Query %d error: %v", i+1, err)
 		}
 	}
-	results.Close()
+	if err := results.Close(); err != nil {
+		log.Printf("Error closing results: %v", err)
+	}
 
 	elapsed := time.Since(start)
 	log.Printf("Completed in %v", elapsed)
