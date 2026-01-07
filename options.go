@@ -10,7 +10,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
-	"github.com/lib/pq/oid"
 )
 
 // ParseFn parses the given query and returns a prepared statement which could
@@ -58,7 +57,7 @@ func WithColumns(columns Columns) PreparedOptionFn {
 
 // WithParameters sets the given parameters as the parameters which are expected
 // by the prepared statement.
-func WithParameters(parameters []oid.Oid) PreparedOptionFn {
+func WithParameters(parameters []uint32) PreparedOptionFn {
 	return func(stmt *PreparedStatement) {
 		stmt.parameters = parameters
 	}
@@ -68,7 +67,7 @@ type PreparedStatements []*PreparedStatement
 
 type PreparedStatement struct {
 	fn         PreparedStatementFn
-	parameters []oid.Oid
+	parameters []uint32
 	columns    Columns
 }
 
@@ -105,6 +104,15 @@ type PortalCache interface {
 	// Close is called at the end of a connection. Close releases all resources
 	// held by the portal cache.
 	Close()
+}
+
+// ParallelPipelineConfig controls whether multiple Execute messages within a pipeline
+// can run concurrently. When Enabled is true, the server may process Execute commands
+// in parallel before the Sync message. When false, Execute commands are processed
+// sequentially. Note that pipelining itself (batching multiple messages before Sync)
+// is always supported; this setting only affects parallel execution of those messages.
+type ParallelPipelineConfig struct {
+	Enabled bool // when true, allows concurrent execution of pipelined Execute messages
 }
 
 type FlushFn func(ctx context.Context) error
@@ -165,6 +173,15 @@ func TerminateConn(fn CloseFn) OptionFn {
 func FlushConn(fn FlushFn) OptionFn {
 	return func(srv *Server) error {
 		srv.FlushConn = fn
+		return nil
+	}
+}
+
+// ParallelPipeline sets the parallel pipeline configuration for the server.
+// This controls whether Execute events can run concurrently within a session.
+func ParallelPipeline(config ParallelPipelineConfig) OptionFn {
+	return func(srv *Server) error {
+		srv.ParallelPipeline = config
 		return nil
 	}
 }
@@ -310,7 +327,7 @@ var QueryParameters = regexp.MustCompile(`\$(\d+)|\?`)
 // ParseParameters attempts to parse the parameters in the given string and
 // returns the expected parameters. This is necessary for the query protocol
 // where the parameter types are expected to be defined in the extended query protocol.
-func ParseParameters(query string) []oid.Oid {
+func ParseParameters(query string) []uint32 {
 	// NOTE: we have to lookup all parameters within the given query.
 	// Parameters could represent positional parameters or anonymous
 	// parameters. We return a zero parameter oid for each parameter
@@ -319,7 +336,7 @@ func ParseParameters(query string) []oid.Oid {
 	// parameters since ony matches are returned by the positional
 	// parameter regex.
 	matches := QueryParameters.FindAllStringSubmatch(query, -1)
-	parameters := make([]oid.Oid, 0, len(matches))
+	parameters := make([]uint32, 0, len(matches))
 	for _, match := range matches {
 		// NOTE: we have to check whether the returned match is a
 		// positional parameter or an un-positional parameter.
