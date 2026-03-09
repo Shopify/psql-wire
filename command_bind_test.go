@@ -36,6 +36,7 @@ func TestHandleBind_ParallelPipeline_Success(t *testing.T) {
 		Statements:       statements,
 		Portals:          &DefaultPortalCache{},
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
+		inExtendedQuery:  true,
 		ResponseQueue:    NewResponseQueue(),
 	}
 
@@ -74,6 +75,7 @@ func TestHandleBind_ParallelPipeline_Error(t *testing.T) {
 		},
 		Portals:          &DefaultPortalCache{},
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
+		inExtendedQuery:  true,
 		ResponseQueue:    NewResponseQueue(),
 	}
 
