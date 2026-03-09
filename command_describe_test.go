@@ -33,6 +33,7 @@ func TestHandleDescribe_ParallelPipeline_StatementSuccess(t *testing.T) {
 		Server:           &Server{logger: logger},
 		Statements:       statements,
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
+		inExtendedQuery:  true,
 		ResponseQueue:    NewResponseQueue(),
 	}
 
@@ -83,6 +84,7 @@ func TestHandleDescribe_ParallelPipeline_PortalSuccess(t *testing.T) {
 		Server:           &Server{logger: logger},
 		Portals:          portals,
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
+		inExtendedQuery:  true,
 		ResponseQueue:    NewResponseQueue(),
 	}
 
@@ -119,6 +121,7 @@ func TestHandleDescribe_ParallelPipeline_Error(t *testing.T) {
 		Server:           &Server{logger: logger},
 		Statements:       &DefaultStatementCache{statements: map[string]*Statement{"unknown_stmt": nil}},
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
+		inExtendedQuery:  true,
 		ResponseQueue:    NewResponseQueue(),
 	}
 

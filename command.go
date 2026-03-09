@@ -52,14 +52,6 @@ func newErrClientCopyFailed(desc string) error {
 	return psqlerr.WithSeverity(psqlerr.WithCode(err, codes.Uncategorized), psqlerr.LevelError)
 }
 
-// ErrSkipToSync is a sentinel error returned by extended query handlers to signal
-// that an error has occurred and the command loop should discard messages until
-// the next Sync message arrives. This implements the PostgreSQL protocol requirement:
-// "When an error is detected while processing any extended-query message, the backend
-// issues ErrorResponse, then reads and discards messages until a Sync is reached,
-// then issues ReadyForQuery and returns to normal message processing."
-var ErrSkipToSync = errors.New("extended query error: skip to sync")
-
 type Session struct {
 	*Server
 	Statements StatementCache
@@ -69,6 +61,31 @@ type Session struct {
 	// pipelining
 	ParallelPipeline ParallelPipelineConfig
 	ResponseQueue    *ResponseQueue
+
+	// inExtendedQuery is true when the current message being handled is an
+	// extended query protocol message (Parse, Bind, Describe, Execute, Close,
+	// Flush, Sync). This lets Session.WriteError behave correctly for both
+	// protocols.
+	inExtendedQuery bool
+
+	// discardUntilSync is set when an error occurs during extended query
+	// processing. Per the PostgreSQL protocol, after an error the server must
+	// discard messages until it receives a Sync, then respond with
+	// ReadyForQuery.
+	discardUntilSync bool
+}
+
+// isExtendedQueryMessage returns true for message types that belong to the
+// extended query protocol and should not emit ReadyForQuery on error.
+func isExtendedQueryMessage(t types.ClientMessage) bool {
+	switch t {
+	case types.ClientParse, types.ClientBind, types.ClientDescribe,
+		types.ClientExecute, types.ClientClose,
+		types.ClientSync, types.ClientFlush:
+		return true
+	default:
+		return false
+	}
 }
 
 // consumeCommands consumes incoming commands sent over the Postgres wire connection.
@@ -87,14 +104,7 @@ func (srv *Session) consumeCommands(ctx context.Context, conn net.Conn, reader *
 	defer srv.Close()
 
 	for {
-		err := srv.consumeSingleCommand(ctx, reader, writer, conn)
-		if errors.Is(err, ErrSkipToSync) {
-			if skipErr := srv.skipToSync(ctx, reader, writer); skipErr != nil {
-				return skipErr
-			}
-			continue
-		}
-		if err != nil {
+		if err = srv.consumeSingleCommand(ctx, reader, writer, conn); err != nil {
 			return err
 		}
 	}
@@ -106,9 +116,11 @@ func (srv *Session) consumeSingleCommand(ctx context.Context, reader *buffer.Rea
 		return err
 	}
 
+	srv.inExtendedQuery = isExtendedQueryMessage(t)
+
 	// NOTE: we could recover from this scenario
 	if errors.Is(err, buffer.ErrMessageSizeExceeded) {
-		err = handleMessageSizeExceeded(reader, writer, err)
+		err = srv.handleMessageSizeExceeded(reader, writer, err)
 		if err != nil {
 			return err
 		}
@@ -146,7 +158,7 @@ func (srv *Session) consumeSingleCommand(ctx context.Context, reader *buffer.Rea
 // type. A fatal error is returned when an unexpected error is returned while
 // consuming the expected message size or when attempting to write the error
 // message back to the client.
-func handleMessageSizeExceeded(reader *buffer.Reader, writer *buffer.Writer, exceeded error) (err error) {
+func (srv *Session) handleMessageSizeExceeded(reader *buffer.Reader, writer *buffer.Writer, exceeded error) (err error) {
 	unwrapped, has := buffer.UnwrapMessageSizeExceeded(exceeded)
 	if !has {
 		return exceeded
@@ -157,7 +169,7 @@ func handleMessageSizeExceeded(reader *buffer.Reader, writer *buffer.Writer, exc
 		return err
 	}
 
-	return ErrorCode(writer, exceeded)
+	return srv.WriteError(writer, exceeded)
 }
 
 // handleCommand handles the given client message. A client message includes a
@@ -165,6 +177,13 @@ func handleMessageSizeExceeded(reader *buffer.Reader, writer *buffer.Writer, exc
 // indicates a action executed by the client.
 // https://www.postgresql.org/docs/14/protocol-message-formats.html
 func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.ClientMessage, reader *buffer.Reader, writer *buffer.Writer) error {
+	// Per the PostgreSQL protocol, after an error during extended query
+	// processing the server discards all messages until it receives a Sync.
+	if srv.discardUntilSync && t != types.ClientSync && t != types.ClientTerminate {
+		srv.logger.Debug("discarding message until sync", slog.String("type", t.String()))
+		return nil
+	}
+
 	switch t {
 	case types.ClientSimpleQuery:
 		return srv.handleSimpleQuery(ctx, reader, writer)
@@ -200,7 +219,7 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 		// At completion of each series of extended-query messages, the frontend
 		// should issue a Sync message. This parameterless message causes the
 		// backend to close the current transaction if it's not inside a
-		// BEGIN/COMMIT transaction block (“close” meaning to commit if no
+		// BEGIN/COMMIT transaction block ("close" meaning to commit if no
 		// error, or roll back if error). Then a ReadyForQuery response is
 		// issued. The purpose of Sync is to provide a resynchronization point
 		// for error recovery. When an error is detected while processing any
@@ -248,9 +267,7 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 		// https://github.com/postgres/postgres/blob/6e1dd2773eb60a6ab87b27b8d9391b756e904ac3/src/backend/tcop/postgres.c#L4295
 		return nil
 	case types.ClientClose:
-		writer.Start(types.ServerCloseComplete) //nolint:errcheck
-		writer.End()                            //nolint:errcheck
-		return nil
+		return srv.handleClose(ctx, reader, writer)
 	case types.ClientTerminate:
 		err := srv.handleConnTerminate(ctx)
 		if err != nil {
@@ -264,13 +281,13 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 
 		return io.EOF
 	default:
-		return ErrorCode(writer, NewErrUnimplementedMessageType(t))
+		return srv.WriteError(writer, NewErrUnimplementedMessageType(t))
 	}
 }
 
 func (srv *Session) handleSimpleQuery(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer) error {
 	if srv.parse == nil {
-		return ErrorCode(writer, NewErrUnimplementedMessageType(types.ClientSimpleQuery))
+		return srv.WriteError(writer, NewErrUnimplementedMessageType(types.ClientSimpleQuery))
 	}
 
 	query, err := reader.GetString()
@@ -296,23 +313,23 @@ func (srv *Session) handleSimpleQuery(ctx context.Context, reader *buffer.Reader
 
 	statements, err := srv.parse(ctx, query)
 	if err != nil {
-		return ErrorCode(writer, err)
+		return srv.WriteError(writer, err)
 	}
 
 	if len(statements) == 0 {
-		return ErrorCode(writer, NewErrUndefinedStatement())
+		return srv.WriteError(writer, NewErrUndefinedStatement())
 	}
 
 	// NOTE: it is possible to send multiple statements in one simple query.
 	for index := range statements {
 		err = statements[index].columns.Define(ctx, writer, nil)
 		if err != nil {
-			return ErrorCode(writer, err)
+			return srv.WriteError(writer, err)
 		}
 
-		err = statements[index].fn(ctx, NewDataWriter(ctx, statements[index].columns, nil, NoLimit, reader, writer), nil)
+		err = statements[index].fn(ctx, NewDataWriter(ctx, srv, statements[index].columns, nil, NoLimit, reader, writer), nil)
 		if err != nil {
-			return ErrorCode(writer, err)
+			return srv.WriteError(writer, err)
 		}
 	}
 
@@ -322,7 +339,7 @@ func (srv *Session) handleSimpleQuery(ctx context.Context, reader *buffer.Reader
 func (srv *Session) handleParse(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer) error {
 	if srv.parse == nil || srv.Statements == nil {
 		err := NewErrUnimplementedMessageType(types.ClientParse)
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.WriteError(writer, err)
 	}
 
 	name, err := reader.GetString()
@@ -360,14 +377,14 @@ func (srv *Session) handleParse(ctx context.Context, reader *buffer.Reader, writ
 
 	statement, err := singleStatement(srv.parse(ctx, query))
 	if err != nil {
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.WriteError(writer, err)
 	}
 
 	srv.logger.Debug("incoming extended query", slog.String("query", query), slog.String("name", name), slog.Int("parameters", len(statement.parameters)))
 
 	err = srv.Statements.Set(ctx, name, statement)
 	if err != nil {
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.WriteError(writer, err)
 	}
 
 	writer.Start(types.ServerParseComplete)
@@ -378,14 +395,14 @@ func (srv *Session) handleParse(ctx context.Context, reader *buffer.Reader, writ
 func (srv *Session) parsePipelined(ctx context.Context, writer *buffer.Writer, name, query string) error {
 	statement, err := singleStatement(srv.parse(ctx, query))
 	if err != nil {
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.drainQueueAndWriteError(ctx, writer, err)
 	}
 
 	srv.logger.Debug("incoming extended query", slog.String("query", query), slog.String("name", name), slog.Int("parameters", len(statement.parameters)))
 
 	err = srv.Statements.Set(ctx, name, statement)
 	if err != nil {
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.drainQueueAndWriteError(ctx, writer, err)
 	}
 
 	srv.ResponseQueue.Enqueue(NewParseCompleteEvent())
@@ -413,11 +430,11 @@ func (srv *Session) handleDescribe(ctx context.Context, reader *buffer.Reader, w
 	case types.DescribeStatement:
 		statement, err := srv.Statements.Get(ctx, name)
 		if err != nil {
-			return srv.writeExtendedQueryError(ctx, writer, err)
+			return srv.WriteError(writer, err)
 		}
 
 		if statement == nil {
-			return srv.writeExtendedQueryError(ctx, writer, errors.New("unknown statement"))
+			return srv.WriteError(writer, errors.New("unknown statement"))
 		}
 
 		if err := srv.writeParameterDescription(writer, statement.parameters); err != nil {
@@ -428,17 +445,17 @@ func (srv *Session) handleDescribe(ctx context.Context, reader *buffer.Reader, w
 	case types.DescribePortal:
 		portal, err := srv.Portals.Get(ctx, name)
 		if err != nil {
-			return srv.writeExtendedQueryError(ctx, writer, err)
+			return srv.WriteError(writer, err)
 		}
 
 		if portal == nil {
-			return srv.writeExtendedQueryError(ctx, writer, errors.New("unknown portal"))
+			return srv.WriteError(writer, errors.New("unknown portal"))
 		}
 
 		return srv.writeColumnDescription(ctx, writer, portal.formats, portal.statement.columns)
 	}
 
-	return srv.writeExtendedQueryError(ctx, writer, fmt.Errorf("unknown describe command: %s", string(d[0])))
+	return srv.WriteError(writer, fmt.Errorf("unknown describe command: %s", string(d[0])))
 }
 
 // describePipelined handles Describe in parallel pipeline mode
@@ -447,11 +464,11 @@ func (srv *Session) describePipelined(ctx context.Context, writer *buffer.Writer
 	case types.DescribeStatement:
 		statement, err := srv.Statements.Get(ctx, name)
 		if err != nil {
-			return srv.writeExtendedQueryError(ctx, writer, err)
+			return srv.drainQueueAndWriteError(ctx, writer, err)
 		}
 
 		if statement == nil {
-			return srv.writeExtendedQueryError(ctx, writer, errors.New("unknown statement"))
+			return srv.drainQueueAndWriteError(ctx, writer, errors.New("unknown statement"))
 		}
 
 		srv.ResponseQueue.Enqueue(NewStmtDescribeEvent(statement.parameters, statement.columns))
@@ -460,18 +477,18 @@ func (srv *Session) describePipelined(ctx context.Context, writer *buffer.Writer
 	case types.DescribePortal:
 		portal, err := srv.Portals.Get(ctx, name)
 		if err != nil {
-			return srv.writeExtendedQueryError(ctx, writer, err)
+			return srv.drainQueueAndWriteError(ctx, writer, err)
 		}
 
 		if portal == nil {
-			return srv.writeExtendedQueryError(ctx, writer, errors.New("unknown portal"))
+			return srv.drainQueueAndWriteError(ctx, writer, errors.New("unknown portal"))
 		}
 
 		srv.ResponseQueue.Enqueue(NewPortalDescribeEvent(portal.statement.columns, portal.formats))
 		return nil
 	}
 
-	return srv.writeExtendedQueryError(ctx, writer, fmt.Errorf("unknown describe command: %s", string(descType)))
+	return srv.drainQueueAndWriteError(ctx, writer, fmt.Errorf("unknown describe command: %s", string(descType)))
 }
 
 // https://www.postgresql.org/docs/15/protocol-message-formats.html
@@ -526,16 +543,16 @@ func (srv *Session) handleBind(ctx context.Context, reader *buffer.Reader, write
 
 	stmt, err := srv.Statements.Get(ctx, statement)
 	if err != nil {
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.WriteError(writer, err)
 	}
 
 	if stmt == nil {
-		return srv.writeExtendedQueryError(ctx, writer, NewErrUnkownStatement(statement))
+		return srv.WriteError(writer, NewErrUnkownStatement(statement))
 	}
 
 	err = srv.Portals.Bind(ctx, name, stmt, parameters, formats)
 	if err != nil {
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.WriteError(writer, err)
 	}
 
 	writer.Start(types.ServerBindComplete)
@@ -546,16 +563,16 @@ func (srv *Session) handleBind(ctx context.Context, reader *buffer.Reader, write
 func (srv *Session) bindPipelined(ctx context.Context, writer *buffer.Writer, name, statement string, parameters []Parameter, formats []FormatCode) error {
 	stmt, err := srv.Statements.Get(ctx, statement)
 	if err != nil {
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.drainQueueAndWriteError(ctx, writer, err)
 	}
 
 	if stmt == nil {
-		return srv.writeExtendedQueryError(ctx, writer, NewErrUnkownStatement(statement))
+		return srv.drainQueueAndWriteError(ctx, writer, NewErrUnkownStatement(statement))
 	}
 
 	err = srv.Portals.Bind(ctx, name, stmt, parameters, formats)
 	if err != nil {
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.drainQueueAndWriteError(ctx, writer, err)
 	}
 
 	srv.ResponseQueue.Enqueue(NewBindCompleteEvent())
@@ -654,7 +671,7 @@ func (srv *Session) readColumnTypes(reader *buffer.Reader) ([]FormatCode, error)
 func (srv *Session) handleExecute(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer) error {
 	if srv.Statements == nil {
 		err := NewErrUnimplementedMessageType(types.ClientExecute)
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.WriteError(writer, err)
 	}
 
 	name, err := reader.GetString()
@@ -677,21 +694,46 @@ func (srv *Session) handleExecute(ctx context.Context, reader *buffer.Reader, wr
 
 	err = srv.Portals.Execute(ctx, name, Limit(limit), reader, writer)
 	if err != nil {
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.WriteError(writer, err)
 	}
 
 	return nil
+}
+
+// handleClose handles the Close message (extended query protocol).
+// The Close message tells the server to close a prepared statement or portal.
+// https://www.postgresql.org/docs/current/protocol-message-formats.html
+func (srv *Session) handleClose(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer) error {
+	d, err := reader.GetBytes(1)
+	if err != nil {
+		return err
+	}
+
+	name, err := reader.GetString()
+	if err != nil {
+		return err
+	}
+
+	srv.logger.Debug("incoming close request", slog.String("type", string(d[0])), slog.String("name", name))
+
+	if srv.ParallelPipeline.Enabled {
+		srv.ResponseQueue.Enqueue(NewCloseCompleteEvent())
+		return nil
+	}
+
+	writer.Start(types.ServerCloseComplete)
+	return writer.End()
 }
 
 // executePipelined handles Execute in parallel pipeline mode
 func (srv *Session) executePipelined(ctx context.Context, writer *buffer.Writer, name string, limit uint32) error {
 	portal, err := srv.Portals.Get(ctx, name)
 	if err != nil {
-		return srv.writeExtendedQueryError(ctx, writer, err)
+		return srv.drainQueueAndWriteError(ctx, writer, err)
 	}
 
 	if portal == nil {
-		return srv.writeExtendedQueryError(ctx, writer, errors.New("unknown portal"))
+		return srv.drainQueueAndWriteError(ctx, writer, errors.New("unknown portal"))
 	}
 
 	// Create result channel and queue the event
@@ -742,11 +784,16 @@ func (srv *Session) handleSync(ctx context.Context, writer *buffer.Writer) error
 		}
 	}
 
+	// Sync always resets discardUntilSync, even if queue processing set it.
+	srv.discardUntilSync = false
+
 	// Original synchronous behavior - just return ReadyForQuery
 	return readyForQuery(writer, types.ServerIdle)
 }
 
-// processResponseQueue drains the queue and writes all events to the writer
+// processResponseQueue drains the queue and writes all events to the writer.
+// Errors from async execution are written as ErrorResponse only (no ReadyForQuery)
+// because the caller (handleSync) will send ReadyForQuery after this returns.
 func (srv *Session) processResponseQueue(ctx context.Context, writer *buffer.Writer) error {
 	events, queueErr := srv.ResponseQueue.DrainSync(ctx)
 
@@ -757,7 +804,8 @@ func (srv *Session) processResponseQueue(ctx context.Context, writer *buffer.Wri
 	}
 
 	if queueErr != nil {
-		if err := ErrorCode(writer, queueErr); err != nil {
+		// Write ErrorResponse without ReadyForQuery — handleSync sends that.
+		if err := WriteUnterminatedError(writer, queueErr); err != nil {
 			return err
 		}
 	}
@@ -792,59 +840,21 @@ func (srv *Session) drainQueueOnError(ctx context.Context, writer *buffer.Writer
 	srv.ResponseQueue.Clear()
 
 	if queueErr != nil {
-		return ErrorCode(writer, queueErr)
+		// Write ErrorResponse without ReadyForQuery — the caller handles that.
+		return WriteUnterminatedError(writer, queueErr)
 	}
 
 	return nil
 }
 
-// drainQueueAndWriteError drains the queue and returns an error code.
+// drainQueueAndWriteError drains the queue and writes an error.
 // This ensures all pending successful responses are written before reporting an error.
+// Used by pipelined handlers where the queue may have pending events.
 func (srv *Session) drainQueueAndWriteError(ctx context.Context, writer *buffer.Writer, err error) error {
 	if drainErr := srv.drainQueueOnError(ctx, writer); drainErr != nil {
 		return drainErr
 	}
-	return ErrorCode(writer, err)
-}
-
-// writeExtendedQueryError handles errors during extended query protocol processing.
-// It drains any pending successful responses, writes the ErrorResponse, and returns
-// ErrSkipToSync to signal that the command loop should discard messages until Sync.
-func (srv *Session) writeExtendedQueryError(ctx context.Context, writer *buffer.Writer, err error) error {
-	if srv.ParallelPipeline.Enabled && srv.ResponseQueue != nil {
-		if drainErr := srv.drainQueueOnError(ctx, writer); drainErr != nil {
-			return drainErr
-		}
-	}
-	if werr := writeErrorResponse(writer, err); werr != nil {
-		return werr
-	}
-	return ErrSkipToSync
-}
-
-// skipToSync reads and discards messages until a Sync message is received.
-// When Sync arrives, it clears any queue state and writes ReadyForQuery.
-// This implements the PostgreSQL protocol error recovery behavior.
-func (srv *Session) skipToSync(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		t, _, err := reader.ReadTypedMsg()
-		if err != nil {
-			return err
-		}
-		srv.logger.Debug("discarding message until sync", slog.String("type", t.String()))
-		if t == types.ClientSync {
-			if srv.ResponseQueue != nil {
-				srv.ResponseQueue.Clear()
-			}
-			return readyForQuery(writer, types.ServerIdle)
-		}
-	}
+	return srv.WriteError(writer, err)
 }
 
 func singleStatement(stmts PreparedStatements, err error) (*PreparedStatement, error) {
@@ -874,6 +884,10 @@ func (srv *Session) writeQueuedResponse(ctx context.Context, writer *buffer.Writ
 		writer.Start(types.ServerBindComplete)
 		return writer.End()
 
+	case ResponseCloseComplete:
+		writer.Start(types.ServerCloseComplete)
+		return writer.End()
+
 	case ResponseStmtDescribe:
 		// Statement Describe writes ParameterDescription followed by RowDescription
 		if err := srv.writeParameterDescription(writer, event.Parameters); err != nil {
@@ -893,14 +907,15 @@ func (srv *Session) writeQueuedResponse(ctx context.Context, writer *buffer.Writ
 			return errors.New("execute event has no result")
 		}
 
-		// Check for execution error
+		// Check for execution error — write ErrorResponse only, no ReadyForQuery.
+		// The caller (processResponseQueue → handleSync) sends ReadyForQuery.
 		if err := event.Result.GetError(); err != nil {
-			return ErrorCode(writer, err)
+			return WriteUnterminatedError(writer, err)
 		}
 
 		// Use DataWriter for correct encoding
 		// Note: We use NoLimit here because the result is already limited during execution
-		dataWriter := NewDataWriter(ctx, event.Result.Columns(), event.Formats, NoLimit, nil, writer)
+		dataWriter := NewDataWriter(ctx, srv, event.Result.Columns(), event.Formats, NoLimit, nil, writer)
 
 		return event.Result.Replay(ctx, dataWriter)
 
