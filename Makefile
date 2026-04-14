@@ -25,7 +25,7 @@ $(BIN)/%: | $(BIN) ; $(info $(M) building $(@F)…)
 
 # golangci-lint is recommended to be installed via the install script instead of go get
 $(BIN)/golangci-lint: | $(BIN) ; $(info $(M) installing  golangci-lint…) @
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s v2.4.0
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s v2.10.1
 
 GOLANGCI_LINT = $(BIN)/golangci-lint
 STRINGER = $(BIN)/stringer
@@ -39,7 +39,7 @@ lint: | $(GOLANGCI_LINT) ; $(info $(M) running golint…) @ ## Run the project l
 
 .PHONY: test
 test: ## Run all tests
-	$Q $(GO) test ./... -timeout 20s
+	$Q $(GO) test ./... -timeout 20s -race
 
 .PHONY: generate
 generate: | $(TOOLS) ; $(info $(M) running go generate…) @ ## Run go generate

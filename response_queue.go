@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"context"
 )
 
@@ -20,6 +21,8 @@ const (
 	// ResponseExecute represents an Execute with its complete result set
 	// (DataRows, CommandComplete)
 	ResponseExecute
+	// ResponseCloseComplete represents a CloseComplete ack
+	ResponseCloseComplete
 )
 
 // ResponseEvent represents an event in the response stream
@@ -35,8 +38,15 @@ type ResponseEvent struct {
 	Formats []FormatCode
 
 	// For ResponseExecute: tracks completion and results
-	ResultChannel chan *QueuedDataWriter // channel to receive results
-	Result        *QueuedDataWriter      // cached result once received
+	ResultChannel chan *executeResult // channel to receive results
+	Result        *executeResult      // cached result once received
+}
+
+// executeResult holds the raw wire bytes or error produced by an async
+// portal execution in the parallel pipeline.
+type executeResult struct {
+	buf *bytes.Buffer
+	err error
 }
 
 // NewParseCompleteEvent creates a ParseComplete response event
@@ -71,12 +81,18 @@ func NewPortalDescribeEvent(columns Columns, formats []FormatCode) *ResponseEven
 	}
 }
 
+// NewCloseCompleteEvent creates a CloseComplete response event
+func NewCloseCompleteEvent() *ResponseEvent {
+	return &ResponseEvent{
+		Kind: ResponseCloseComplete,
+	}
+}
+
 // NewExecuteEvent creates an Execute response event
-func NewExecuteEvent(resultChan chan *QueuedDataWriter, formats []FormatCode) *ResponseEvent {
+func NewExecuteEvent(resultChan chan *executeResult) *ResponseEvent {
 	return &ResponseEvent{
 		Kind:          ResponseExecute,
 		ResultChannel: resultChan,
-		Formats:       formats,
 	}
 }
 
@@ -111,10 +127,10 @@ func (q *ResponseQueue) DrainSync(ctx context.Context) ([]*ResponseEvent, error)
 				case res := <-event.ResultChannel:
 					event.Result = res
 					// Check if the result contains an error
-					if res != nil && res.GetError() != nil {
+					if res != nil && res.err != nil {
 						// Return events processed so far,not including the error event
 						// Events after this one won't be sent on the wire
-						return processedEvents, res.GetError()
+						return processedEvents, res.err
 					}
 				case <-ctx.Done():
 					// Context cancelled - return events processed up to this point
@@ -128,7 +144,6 @@ func (q *ResponseQueue) DrainSync(ctx context.Context) ([]*ResponseEvent, error)
 		processedEvents = append(processedEvents, event)
 	}
 
-	// All events processed successfully
 	return processedEvents, nil
 }
 
