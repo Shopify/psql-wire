@@ -174,5 +174,11 @@ func (column Column) Write(ctx context.Context, writer *buffer.Writer, format Fo
 	writer.AddInt32(length)
 	writer.AddBytes(bb)
 
+	if src != nil {
+		if obs := EncodeObserverFromContext(ctx); obs != nil {
+			obs(ctx, format, uint32(column.Oid), len(bb))
+		}
+	}
+
 	return nil
 }

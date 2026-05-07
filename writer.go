@@ -40,6 +40,12 @@ type DataWriter interface {
 	// Columns returns the columns that are currently defined within the writer.
 	Columns() Columns
 
+	// Formats returns the per-column wire format codes negotiated for the
+	// current portal. The slice is read-only — callers must not mutate it.
+	// An empty slice means no formats were negotiated (the default text
+	// format applies to every column).
+	Formats() []FormatCode
+
 	// Complete announces to the client that the command has been completed and
 	// no further data should be expected.
 	//
@@ -95,6 +101,10 @@ type dataWriter struct {
 
 func (writer *dataWriter) Columns() Columns {
 	return writer.columns
+}
+
+func (writer *dataWriter) Formats() []FormatCode {
+	return writer.formats
 }
 
 func (writer *dataWriter) Define(columns Columns) error {

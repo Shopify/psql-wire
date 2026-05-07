@@ -131,6 +131,7 @@ type Server struct {
 	Version          string
 	ShutdownTimeout  time.Duration
 	typeExtension    func(*pgtype.Map)
+	encodeObserver   EncodeObserver
 	closer           chan struct{}
 }
 
@@ -217,6 +218,7 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 
 	ctx = setTypeInfo(ctx, connectionTypes)
 	ctx = setRemoteAddress(ctx, conn.RemoteAddr())
+	ctx = setEncodeObserver(ctx, srv.encodeObserver)
 	defer conn.Close() //nolint:errcheck
 
 	srv.logger.Debug("serving a new client connection")
