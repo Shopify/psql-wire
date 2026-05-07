@@ -292,6 +292,28 @@ func ExtendTypes(fn func(*pgtype.Map)) OptionFn {
 	}
 }
 
+// EncodeObserver is invoked once per column value successfully encoded for a
+// DataRow. It receives the wire format the column was encoded with, the
+// Postgres OID of the column type, and the number of bytes written for that
+// value. It is called on the per-row hot path; implementations should be
+// allocation-free and non-blocking.
+//
+// NULL values (src == nil) are not reported. The observer must not retain ctx
+// or mutate any of its arguments. The same context that was used to encode the
+// value is passed through so observers can read connection-scoped metadata
+// (e.g. via SessionMiddleware) without additional plumbing.
+type EncodeObserver func(ctx context.Context, format FormatCode, oid uint32, n int)
+
+// WithEncodeObserver installs an [EncodeObserver] on the server. The observer
+// is invoked once per encoded column value (excluding NULLs) on every
+// connection. Passing a nil observer is a no-op.
+func WithEncodeObserver(obs EncodeObserver) OptionFn {
+	return func(srv *Server) error {
+		srv.encodeObserver = obs
+		return nil
+	}
+}
+
 // SessionMiddleware sets the given session handler within the underlying server. The
 // session handler is called when a new connection is opened and authenticated
 // allowing for additional metadata to be wrapped around the connection context.

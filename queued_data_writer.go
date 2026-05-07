@@ -43,6 +43,13 @@ func (rc *QueuedDataWriter) Columns() Columns {
 	return rc.columns
 }
 
+// Formats returns nil because QueuedDataWriter does not perform encoding —
+// it buffers raw row values and replays them through a real DataWriter.
+// Format negotiation happens on the replay target.
+func (rc *QueuedDataWriter) Formats() []FormatCode {
+	return nil
+}
+
 func (rc *QueuedDataWriter) Written() uint32 {
 	return rc.written
 }
