@@ -25,6 +25,7 @@ func TestFormatsMatchNegotiatedWireOutput(t *testing.T) {
 				result := conn.ExecParams(context.Background(), "formats", nil, nil, nil, formats).Read()
 				require.NoError(t, result.Err)
 				require.Len(t, result.Rows, 1)
+				require.Len(t, result.FieldDescriptions, 2)
 				var want []FormatCode
 				for _, format := range formats {
 					want = append(want, FormatCode(format))

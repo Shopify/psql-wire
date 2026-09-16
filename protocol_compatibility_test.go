@@ -56,12 +56,21 @@ func TestCompatibilityBindDescribeErrorRecovery(t *testing.T) {
 		&pgproto3.Bind{DestinationPortal: "p", PreparedStatement: "missing"},
 		&pgproto3.Bind{DestinationPortal: "p", PreparedStatement: "cache-error"},
 		&pgproto3.Describe{ObjectType: 'S', Name: "cache-error"},
+		&pgproto3.Bind{DestinationPortal: "bind-error", PreparedStatement: "existing"},
+		&pgproto3.Describe{ObjectType: 'P', Name: "cache-error"},
 	} {
 		t.Run(fmt.Sprintf("%T/%v", message, message), func(t *testing.T) {
 			conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
 				return Prepared(NewStatement(func(context.Context, DataWriter, []Parameter) error { return nil })), nil
-			}, Statements(func() StatementCache { return &failingLookupCache{DefaultStatementCacheFn()} }))
+			}, Statements(func() StatementCache { return &failingLookupCache{DefaultStatementCacheFn()} }),
+				Portals(func() PortalCache { return &failingPortalCache{DefaultPortalCacheFn()} }))
 			f := conn.Frontend()
+			f.Send(&pgproto3.Parse{Name: "existing", Query: "setup"})
+			f.Send(&pgproto3.Sync{})
+			require.NoError(t, f.Flush())
+			setup := readCompatibilityBatch(t, f)
+			require.Empty(t, setup.errors)
+			require.Equal(t, 1, setup.parses)
 			f.Send(message)
 			f.Send(&pgproto3.Parse{Name: "discarded", Query: "ignored after error"})
 			f.Send(&pgproto3.Sync{})
@@ -115,6 +124,22 @@ func (c *failingLookupCache) Get(ctx context.Context, name string) (*Statement, 
 		return nil, errors.New("cache lookup failed")
 	}
 	return c.StatementCache.Get(ctx, name)
+}
+
+type failingPortalCache struct{ PortalCache }
+
+func (c *failingPortalCache) Bind(ctx context.Context, name string, stmt *Statement, params []Parameter, formats []FormatCode) error {
+	if name == "bind-error" {
+		return errors.New("portal bind failed")
+	}
+	return c.PortalCache.Bind(ctx, name, stmt, params, formats)
+}
+
+func (c *failingPortalCache) Get(ctx context.Context, name string) (*Portal, error) {
+	if name == "cache-error" {
+		return nil, errors.New("portal lookup failed")
+	}
+	return c.PortalCache.Get(ctx, name)
 }
 
 func compatibilityClient(t *testing.T, handler ParseFn, options ...OptionFn) *pgconn.PgConn {
