@@ -5,10 +5,10 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
 	"github.com/jeroenrinzema/psql-wire/pkg/mock"
 	"github.com/jeroenrinzema/psql-wire/pkg/types"
-	"github.com/lib/pq/oid"
 	"github.com/neilotoole/slogt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,8 +24,8 @@ func TestHandleBind_ParallelPipeline_Success(t *testing.T) {
 	statements := &DefaultStatementCache{}
 	stmt := NewStatement(
 		func(ctx context.Context, writer DataWriter, parameters []Parameter) error { return nil },
-		WithParameters([]oid.Oid{oid.T_int4}),
-		WithColumns(Columns{{Name: "col1", Oid: oid.T_int4}}),
+		WithParameters([]uint32{pgtype.Int4OID}),
+		WithColumns(Columns{{Name: "col1", Oid: pgtype.Int4OID}}),
 	)
 	require.NoError(t, statements.Set(ctx, "test_stmt", stmt))
 

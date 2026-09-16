@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lib/pq/oid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -55,7 +55,6 @@ func TestResponseQueueBasicOperations(t *testing.T) {
 	// Queue should be empty after drain
 	assert.Equal(t, 0, queue.Len())
 }
-
 
 // TestResponseQueueClear tests clearing the queue for a new cycle
 func TestResponseQueueClear(t *testing.T) {
@@ -231,14 +230,14 @@ func TestDrainSyncNoExecuteEvents(t *testing.T) {
 	queue.Enqueue(NewParseCompleteEvent())
 	queue.Enqueue(NewBindCompleteEvent())
 	queue.Enqueue(NewStmtDescribeEvent(
-		[]oid.Oid{oid.T_int4, oid.T_text},
+		[]uint32{pgtype.Int4OID, pgtype.TextOID},
 		Columns{
-			{Name: "id", Oid: oid.T_int8},
-			{Name: "name", Oid: oid.T_text},
+			{Name: "id", Oid: pgtype.Int8OID},
+			{Name: "name", Oid: pgtype.TextOID},
 		},
 	))
 	queue.Enqueue(NewPortalDescribeEvent(
-		Columns{{Name: "result", Oid: oid.T_text}},
+		Columns{{Name: "result", Oid: pgtype.TextOID}},
 		[]FormatCode{BinaryFormat},
 	))
 
@@ -253,7 +252,7 @@ func TestDrainSyncNoExecuteEvents(t *testing.T) {
 
 	// Verify StmtDescribe data
 	assert.Equal(t, ResponseStmtDescribe, events[2].Kind)
-	assert.Equal(t, []oid.Oid{oid.T_int4, oid.T_text}, events[2].Parameters)
+	assert.Equal(t, []uint32{pgtype.Int4OID, pgtype.TextOID}, events[2].Parameters)
 	require.Len(t, events[2].Columns, 2)
 	assert.Equal(t, "id", events[2].Columns[0].Name)
 

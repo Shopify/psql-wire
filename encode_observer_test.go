@@ -9,8 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/lib/pq"
-	"github.com/lib/pq/oid"
 	"github.com/neilotoole/slogt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -55,8 +55,8 @@ func twoColumnTestServer(t *testing.T, opts ...OptionFn) *Server {
 		}
 
 		columns := Columns{
-			{Name: "name", Oid: oid.T_text, Width: 256},
-			{Name: "age", Oid: oid.T_int4, Width: 4},
+			{Name: "name", Oid: pgtype.TextOID, Width: 256},
+			{Name: "age", Oid: pgtype.Int4OID, Width: 4},
 		}
 
 		return Prepared(NewStatement(fn, WithColumns(columns))), nil
@@ -98,8 +98,8 @@ func TestEncodeObserverTextFormat(t *testing.T) {
 		assert.Greater(t, e.n, 0)
 	}
 
-	assert.Equal(t, uint32(oid.T_text), entries[0].oid)
-	assert.Equal(t, uint32(oid.T_int4), entries[1].oid)
+	assert.Equal(t, uint32(pgtype.TextOID), entries[0].oid)
+	assert.Equal(t, uint32(pgtype.Int4OID), entries[1].oid)
 }
 
 func TestEncodeObserverBinaryFormat(t *testing.T) {
@@ -178,9 +178,9 @@ func TestEncodeObserverPgxDefault(t *testing.T) {
 
 	// Two rows × {text-column, int4-column}. Per-row order is preserved.
 	assert.Equal(t, TextFormat, entries[0].format, "name (text) → pgx prefers text")
-	assert.Equal(t, uint32(oid.T_text), entries[0].oid)
+	assert.Equal(t, uint32(pgtype.TextOID), entries[0].oid)
 	assert.Equal(t, BinaryFormat, entries[1].format, "age (int4) → pgx prefers binary")
-	assert.Equal(t, uint32(oid.T_int4), entries[1].oid)
+	assert.Equal(t, uint32(pgtype.Int4OID), entries[1].oid)
 	assert.Equal(t, TextFormat, entries[2].format)
 	assert.Equal(t, BinaryFormat, entries[3].format)
 }
@@ -218,8 +218,8 @@ func TestEncodeObserverSkipsNullValues(t *testing.T) {
 		}
 
 		columns := Columns{
-			{Name: "name", Oid: oid.T_text, Width: 256},
-			{Name: "age", Oid: oid.T_int4, Width: 4},
+			{Name: "name", Oid: pgtype.TextOID, Width: 256},
+			{Name: "age", Oid: pgtype.Int4OID, Width: 4},
 		}
 
 		return Prepared(NewStatement(fn, WithColumns(columns))), nil
@@ -246,7 +246,7 @@ func TestEncodeObserverSkipsNullValues(t *testing.T) {
 
 	entries := rec.snapshot()
 	require.Len(t, entries, 1, "NULL values must not be observed")
-	assert.Equal(t, uint32(oid.T_text), entries[0].oid)
+	assert.Equal(t, uint32(pgtype.TextOID), entries[0].oid)
 }
 
 func TestDataWriterFormats(t *testing.T) {
@@ -265,7 +265,7 @@ func TestDataWriterFormats(t *testing.T) {
 		}
 
 		columns := Columns{
-			{Name: "v", Oid: oid.T_text, Width: 256},
+			{Name: "v", Oid: pgtype.TextOID, Width: 256},
 		}
 		return Prepared(NewStatement(fn, WithColumns(columns))), nil
 	}

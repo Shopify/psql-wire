@@ -2,8 +2,6 @@ package wire
 
 import (
 	"context"
-
-	"github.com/lib/pq/oid"
 )
 
 // ResponseEventKind represents the type of event in the ResponseQueue
@@ -32,7 +30,7 @@ type ResponseEvent struct {
 	Kind ResponseEventKind
 
 	// For ResponseStmtDescribe: holds parameter OIDs and column definitions
-	Parameters []oid.Oid
+	Parameters []uint32
 	Columns    Columns
 
 	// For ResponsePortalDescribe and ResponseExecute: format codes for result columns
@@ -58,7 +56,7 @@ func NewBindCompleteEvent() *ResponseEvent {
 }
 
 // NewStmtDescribeEvent creates a statement Describe response event
-func NewStmtDescribeEvent(parameters []oid.Oid, columns Columns) *ResponseEvent {
+func NewStmtDescribeEvent(parameters []uint32, columns Columns) *ResponseEvent {
 	return &ResponseEvent{
 		Kind:       ResponseStmtDescribe,
 		Parameters: parameters,
