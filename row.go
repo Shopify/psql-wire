@@ -71,6 +71,10 @@ func (columns Columns) CopyIn(ctx context.Context, writer *buffer.Writer, format
 // Binary. If you provide a single format code, it will be applied to all
 // columns.
 func (columns Columns) Write(ctx context.Context, formats []FormatCode, writer *buffer.Writer, srcs []any) (err error) {
+	return columns.write(ctx, formats, writer, srcs, nil)
+}
+
+func (columns Columns) write(ctx context.Context, formats []FormatCode, writer *buffer.Writer, srcs []any, scratch *[]byte) (err error) {
 	if len(srcs) != len(columns) {
 		return fmt.Errorf("unexpected columns, %d columns are defined inside the given table but %d were given", len(columns), len(srcs))
 	}
@@ -88,7 +92,7 @@ func (columns Columns) Write(ctx context.Context, formats []FormatCode, writer *
 			format = formats[index]
 		}
 
-		err = column.Write(ctx, writer, format, srcs[index])
+		err = column.write(ctx, writer, format, srcs[index], scratch)
 		if err != nil {
 			return err
 		}
@@ -147,6 +151,10 @@ func (column Column) Define(ctx context.Context, writer *buffer.Writer, format F
 //
 // [DataRow]: https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-DATAROW
 func (column Column) Write(ctx context.Context, writer *buffer.Writer, format FormatCode, src any) (err error) {
+	return column.write(ctx, writer, format, src, nil)
+}
+
+func (column Column) write(ctx context.Context, writer *buffer.Writer, format FormatCode, src any, scratch *[]byte) (err error) {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -157,6 +165,9 @@ func (column Column) Write(ctx context.Context, writer *buffer.Writer, format Fo
 	}
 
 	bb := make([]byte, 0)
+	if scratch != nil && *scratch != nil {
+		bb = (*scratch)[:0]
+	}
 	bb, err = tm.Encode(uint32(column.Oid), int16(format), src, bb)
 	if err != nil {
 		return err
@@ -172,6 +183,16 @@ func (column Column) Write(ctx context.Context, writer *buffer.Writer, format Fo
 
 	writer.AddInt32(length)
 	writer.AddBytes(bb)
+
+	// AddBytes copies the encoded value into the row frame before scratch is
+	// reused. A nil result must not discard a previously allocated buffer.
+	if scratch != nil && bb != nil {
+		if cap(bb) <= maxEncodeScratchCapacity {
+			*scratch = bb[:0]
+		} else {
+			*scratch = nil
+		}
+	}
 
 	if src != nil {
 		if obs := EncodeObserverFromContext(ctx); obs != nil {
