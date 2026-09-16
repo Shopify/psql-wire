@@ -49,6 +49,7 @@ func TestHandleExecute_ParallelPipeline_Success(t *testing.T) {
 		Statements:       &DefaultStatementCache{},
 		Portals:          &DefaultPortalCache{},
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
+		inExtendedQuery:  true,
 		ResponseQueue:    NewResponseQueue(),
 	}
 
@@ -156,8 +157,8 @@ func TestHandleExecute_ParallelPipeline_StatementError(t *testing.T) {
 		Statements:       &DefaultStatementCache{},
 		Portals:          portals,
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
-		ResponseQueue:    NewResponseQueue(),
 		inExtendedQuery:  true,
+		ResponseQueue:    NewResponseQueue(),
 	}
 
 	outBuf := &bytes.Buffer{}
@@ -201,8 +202,8 @@ func TestHandleExecute_ParallelPipeline_UnknownPortal(t *testing.T) {
 		Statements:       &DefaultStatementCache{},
 		Portals:          &DefaultPortalCache{},
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
-		ResponseQueue:    NewResponseQueue(),
 		inExtendedQuery:  true,
+		ResponseQueue:    NewResponseQueue(),
 	}
 
 	// Pre-enqueue a successful event to ensure it's flushed before the error
@@ -274,8 +275,8 @@ func TestHandleExecute_ParallelPipeline_AsyncPanic(t *testing.T) {
 		Statements:       &DefaultStatementCache{},
 		Portals:          portals,
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
-		ResponseQueue:    NewResponseQueue(),
 		inExtendedQuery:  true,
+		ResponseQueue:    NewResponseQueue(),
 	}
 
 	outBuf := &bytes.Buffer{}

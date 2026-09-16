@@ -195,6 +195,18 @@ func ParallelPipeline(config ParallelPipelineConfig) OptionFn {
 	}
 }
 
+// PortalSuspension controls resumable Execute row limits (enabled by default).
+// Disabling it preserves the pre-v0.19 behavior: attempts to emit more than the
+// requested limit return ErrRowLimitExceeded and the handler unwinds. This is
+// useful for embedders whose deadline-bound execution resources cannot remain
+// retained by an abandoned suspended portal.
+func PortalSuspension(enabled bool) OptionFn {
+	return func(srv *Server) error {
+		srv.disablePortalSuspension = !enabled
+		return nil
+	}
+}
+
 // ErrorSanitizer sets a function that transforms errors before they are sent
 // to the client. This hook is called before writing any ErrorResponse to the
 // wire, including during authentication. It can be used to mask internal error
@@ -307,6 +319,28 @@ func WithShutdownTimeout(timeout time.Duration) OptionFn {
 func ExtendTypes(fn func(*pgtype.Map)) OptionFn {
 	return func(srv *Server) error {
 		srv.typeExtension = fn
+		return nil
+	}
+}
+
+// EncodeObserver is invoked once per column value successfully encoded for a
+// DataRow. It receives the wire format the column was encoded with, the
+// Postgres OID of the column type, and the number of bytes written for that
+// value. It is called on the per-row hot path; implementations should be
+// allocation-free and non-blocking.
+//
+// NULL values (src == nil) are not reported. The observer must not retain ctx
+// or mutate any of its arguments. The same context that was used to encode the
+// value is passed through so observers can read connection-scoped metadata
+// (e.g. via SessionMiddleware) without additional plumbing.
+type EncodeObserver func(ctx context.Context, format FormatCode, oid uint32, n int)
+
+// WithEncodeObserver installs an [EncodeObserver] on the server. The observer
+// is invoked once per encoded column value (excluding NULLs) on every
+// connection. Passing a nil observer is a no-op.
+func WithEncodeObserver(obs EncodeObserver) OptionFn {
+	return func(srv *Server) error {
+		srv.encodeObserver = obs
 		return nil
 	}
 }

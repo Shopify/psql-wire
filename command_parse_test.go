@@ -36,6 +36,7 @@ func TestHandleParse_ParallelPipeline_Success(t *testing.T) {
 		Server:           &Server{logger: logger, parse: mockParse},
 		Statements:       &DefaultStatementCache{},
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
+		inExtendedQuery:  true,
 		ResponseQueue:    NewResponseQueue(),
 	}
 
@@ -75,6 +76,7 @@ func TestHandleParse_ParallelPipeline_MultipleCommands(t *testing.T) {
 		Server:           &Server{logger: logger, parse: mockParse},
 		Statements:       &DefaultStatementCache{},
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
+		inExtendedQuery:  true,
 		ResponseQueue:    NewResponseQueue(),
 	}
 
@@ -119,8 +121,8 @@ func TestHandleParse_ParallelPipeline_Error(t *testing.T) {
 		Server:           &Server{logger: logger, parse: mockParse},
 		Statements:       &DefaultStatementCache{},
 		ParallelPipeline: ParallelPipelineConfig{Enabled: true},
-		ResponseQueue:    NewResponseQueue(),
 		inExtendedQuery:  true,
+		ResponseQueue:    NewResponseQueue(),
 	}
 
 	// Enqueue a previous event

@@ -145,7 +145,10 @@ type Server struct {
 	Version          string
 	ShutdownTimeout  time.Duration
 	typeExtension    func(*pgtype.Map)
-	closer           chan struct{}
+	encodeObserver   EncodeObserver
+	// Compatibility for embedders whose execution leases cannot be suspended.
+	disablePortalSuspension bool
+	closer                  chan struct{}
 }
 
 // ListenAndServe opens a new Postgres server on the preconfigured address and
@@ -231,6 +234,7 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 	// when multiple goroutines access the same map concurrently during query execution
 	ctx = setTypeInfo(ctx, srv.newTypeMap())
 	ctx = setRemoteAddress(ctx, conn.RemoteAddr())
+	ctx = setEncodeObserver(ctx, srv.encodeObserver)
 	defer conn.Close() //nolint:errcheck
 
 	srv.logger.Debug("serving a new client connection")
@@ -325,13 +329,12 @@ func (srv *Server) Close() error {
 // within the shorter of the context deadline or the server's configured ShutdownTimeout.
 // If the context has no deadline, the server's ShutdownTimeout is used.
 func (srv *Server) Shutdown(ctx context.Context) error {
-	// Check if already shutting down or shut down
+	// Every caller must honor its own deadline, including a force-close call
+	// after a previous graceful shutdown exhausted its budget.
 	srv.closingMu.Lock()
-	if !srv.closing.CompareAndSwap(false, true) {
-		// If already closing, just wait for existing shutdown to complete
-		srv.closingMu.Unlock()
-		srv.wg.Wait()
-		return nil
+	first := srv.closing.CompareAndSwap(false, true)
+	if first {
+		close(srv.closer)
 	}
 	srv.closingMu.Unlock()
 
@@ -351,9 +354,6 @@ func (srv *Server) Shutdown(ctx context.Context) error {
 	defer cancel()
 
 	srv.logger.Info("starting graceful shutdown")
-
-	// Close the closer channel (we're the first/only one to get here)
-	close(srv.closer)
 
 	// Wait for active connections to finish or timeout
 	done := make(chan struct{})

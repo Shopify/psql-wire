@@ -14,6 +14,7 @@ const (
 	ctxClientMetadata
 	ctxServerMetadata
 	ctxRemoteAddr
+	ctxEncodeObserver
 )
 
 // setTypeInfo constructs a new Postgres type connection info for the given value
@@ -34,6 +35,27 @@ func TypeMap(ctx context.Context) *pgtype.Map {
 
 func setRemoteAddress(ctx context.Context, addr net.Addr) context.Context {
 	return context.WithValue(ctx, ctxRemoteAddr, addr)
+}
+
+// setEncodeObserver returns a derived context that carries the given
+// EncodeObserver. A nil observer leaves the context unchanged so that
+// EncodeObserverFromContext returns nil for callers that haven't opted in.
+func setEncodeObserver(ctx context.Context, obs EncodeObserver) context.Context {
+	if obs == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxEncodeObserver, obs)
+}
+
+// EncodeObserverFromContext returns the EncodeObserver installed on the
+// context by [WithEncodeObserver], or nil if none is set. Exported so handlers
+// and middleware can introspect or chain observers.
+func EncodeObserverFromContext(ctx context.Context) EncodeObserver {
+	val := ctx.Value(ctxEncodeObserver)
+	if val == nil {
+		return nil
+	}
+	return val.(EncodeObserver)
 }
 
 // RemoteAddress returns the Postgres remote address connection info if it has been set inside

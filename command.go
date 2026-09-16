@@ -223,7 +223,7 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 		// At completion of each series of extended-query messages, the frontend
 		// should issue a Sync message. This parameterless message causes the
 		// backend to close the current transaction if it's not inside a
-		// BEGIN/COMMIT transaction block (“close” meaning to commit if no
+		// BEGIN/COMMIT transaction block ("close" meaning to commit if no
 		// error, or roll back if error). Then a ReadyForQuery response is
 		// issued. The purpose of Sync is to provide a resynchronization point
 		// for error recovery. When an error is detected while processing any
@@ -455,7 +455,7 @@ func (srv *Session) handleDescribe(ctx context.Context, reader *buffer.Reader, w
 	case types.DescribeStatement:
 		statement, err := srv.Statements.Get(ctx, name)
 		if err != nil {
-			return err
+			return srv.WriteError(writer, err)
 		}
 
 		if statement == nil {
@@ -470,7 +470,7 @@ func (srv *Session) handleDescribe(ctx context.Context, reader *buffer.Reader, w
 	case types.DescribePortal:
 		portal, err := srv.Portals.Get(ctx, name)
 		if err != nil {
-			return err
+			return srv.WriteError(writer, err)
 		}
 
 		if portal == nil {
@@ -568,16 +568,16 @@ func (srv *Session) handleBind(ctx context.Context, reader *buffer.Reader, write
 
 	stmt, err := srv.Statements.Get(ctx, statement)
 	if err != nil {
-		return err
+		return srv.WriteError(writer, err)
 	}
 
 	if stmt == nil {
-		return NewErrUnkownStatement(statement)
+		return srv.WriteError(writer, NewErrUnkownStatement(statement))
 	}
 
 	err = srv.Portals.Bind(ctx, name, stmt, parameters, formats)
 	if err != nil {
-		return err
+		return srv.WriteError(writer, err)
 	}
 
 	writer.Start(types.ServerBindComplete)
@@ -842,7 +842,9 @@ func (srv *Session) handleSync(ctx context.Context, writer *buffer.Writer) error
 	return readyForQuery(writer, types.ServerIdle)
 }
 
-// processResponseQueue drains the queue and writes all events to the writer
+// processResponseQueue drains the queue and writes all events to the writer.
+// Errors from async execution are written as ErrorResponse only (no ReadyForQuery)
+// because the caller (handleSync) will send ReadyForQuery after this returns.
 func (srv *Session) processResponseQueue(ctx context.Context, writer *buffer.Writer) error {
 	events, queueErr := srv.ResponseQueue.DrainSync(ctx)
 
@@ -894,8 +896,9 @@ func (srv *Session) drainQueueOnError(ctx context.Context, writer *buffer.Writer
 	return nil
 }
 
-// drainQueueAndWriteError drains the queue and returns an error code.
+// drainQueueAndWriteError drains the queue and writes an error.
 // This ensures all pending successful responses are written before reporting an error.
+// Used by pipelined handlers where the queue may have pending events.
 func (srv *Session) drainQueueAndWriteError(ctx context.Context, writer *buffer.Writer, err error) error {
 	if drainErr := srv.drainQueueOnError(ctx, writer); drainErr != nil {
 		return drainErr

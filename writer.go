@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 
+	"github.com/jeroenrinzema/psql-wire/codes"
+	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
 	"github.com/jeroenrinzema/psql-wire/pkg/types"
 )
@@ -28,6 +30,12 @@ type DataWriter interface {
 	// Columns returns the columns that are currently defined within the writer.
 	Columns() Columns
 
+	// Formats returns the per-column wire format codes negotiated for the
+	// current portal. The slice is read-only — callers must not mutate it.
+	// An empty slice means no formats were negotiated (the default text
+	// format applies to every column).
+	Formats() []FormatCode
+
 	// Complete announces to the client that the command has been completed and
 	// no further data should be expected.
 	//
@@ -50,6 +58,9 @@ var ErrDataWritten = errors.New("data has already been written")
 // ErrClosedWriter is returned when the data writer has been closed.
 var ErrClosedWriter = errors.New("closed writer")
 
+// ErrRowLimitExceeded is returned only when portal suspension is disabled.
+var ErrRowLimitExceeded = pgerror.WithCode(errors.New("row limit exceeded"), codes.ProgramLimitExceeded)
+
 // dataWriter implements DataWriter for use inside an iter.Seq push
 // iterator. Row encodes the row to the wire and then yields to the pull
 // consumer for flow control. Complete writes CommandComplete to the wire.
@@ -67,15 +78,24 @@ type dataWriter struct {
 	tag     *string
 	closed  bool
 	written uint32
+	limit   Limit // legacy fail-at-limit mode; zero means no limit
 }
 
 func (writer *dataWriter) Columns() Columns {
 	return writer.columns
 }
 
+func (writer *dataWriter) Formats() []FormatCode {
+	return writer.formats
+}
+
 func (writer *dataWriter) Row(values []any) error {
 	if writer.closed {
 		return ErrClosedWriter
+	}
+
+	if writer.limit != NoLimit && Limit(writer.written) >= writer.limit {
+		return ErrRowLimitExceeded
 	}
 
 	err := writer.columns.Write(writer.ctx, writer.formats, writer.client, values)

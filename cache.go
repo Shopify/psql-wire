@@ -90,6 +90,9 @@ type Portal struct {
 	// The iterator state (created by iter.Pull)
 	next func() (struct{}, bool)
 	stop func()
+	// The handler survives suspension, but parallel Executes have distinct
+	// output buffers. Rebind its writer before each sequential resume.
+	writer *dataWriter
 	// Filled in by dataWriter.Complete when the handler finishes. Used to
 	// return the tag when re-executing a completed portal.
 	tag string
@@ -126,6 +129,7 @@ func (p *Portal) close() {
 		p.stop()
 		p.next = nil
 		p.stop = nil
+		p.writer = nil
 	}
 }
 
@@ -148,6 +152,11 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 		// This is the first execute call on this portal. So let's start the
 		// execution. Otherwise we continue from where we left off.
 		session, _ := GetSession(ctx)
+		legacyLimit := NoLimit
+		if session != nil && session.Server != nil && session.disablePortalSuspension {
+			legacyLimit = limit
+			limit = NoLimit // Row enforces the limit; never leave the handler suspended.
+		}
 		// Create a simple push-style iterator (iter.Seq) around the
 		// statement.fn.
 		seq := func(yield func(struct{}) bool) {
@@ -160,7 +169,9 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 				client:  writer,
 				yield:   yield,
 				tag:     &p.tag,
+				limit:   legacyLimit,
 			}
+			p.writer = dw
 			err := p.statement.fn(ctx, dw, p.parameters)
 			if err != nil && !errors.Is(err, ErrSuspendedHandlerClosed) {
 				p.err = err
@@ -170,6 +181,9 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 		// Then we convert that push-style iterator into a pull-style iterator,
 		// so we can suspend the iterator when we reach the row limit.
 		p.next, p.stop = iter.Pull(seq)
+	} else {
+		p.writer.client = writer
+		p.writer.reader = reader
 	}
 
 	var count Limit
