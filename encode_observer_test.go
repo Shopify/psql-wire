@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/lib/pq"
+	_ "github.com/lib/pq"
 	"github.com/neilotoole/slogt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -287,9 +287,6 @@ func TestDataWriterFormats(t *testing.T) {
 	}
 	require.NoError(t, rows.Close())
 
-	// lib/pq simple query protocol means no formats are negotiated, so the
-	// dataWriter's formats slice is whatever the bind step provided (often
-	// empty). We assert the API is reachable rather than the exact value.
-	_ = captured
-	_ = pq.Driver{}
+	// Simple query protocol has no negotiated result-format override.
+	require.Empty(t, captured)
 }

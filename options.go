@@ -195,6 +195,18 @@ func ParallelPipeline(config ParallelPipelineConfig) OptionFn {
 	}
 }
 
+// PortalSuspension controls resumable Execute row limits (enabled by default).
+// Disabling it preserves the pre-v0.19 behavior: attempts to emit more than the
+// requested limit return ErrRowLimitExceeded and the handler unwinds. This is
+// useful for embedders whose deadline-bound execution resources cannot remain
+// retained by an abandoned suspended portal.
+func PortalSuspension(enabled bool) OptionFn {
+	return func(srv *Server) error {
+		srv.disablePortalSuspension = !enabled
+		return nil
+	}
+}
+
 // ErrorSanitizer sets a function that transforms errors before they are sent
 // to the client. This hook is called before writing any ErrorResponse to the
 // wire, including during authentication. It can be used to mask internal error

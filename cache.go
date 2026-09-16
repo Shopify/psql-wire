@@ -152,6 +152,11 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 		// This is the first execute call on this portal. So let's start the
 		// execution. Otherwise we continue from where we left off.
 		session, _ := GetSession(ctx)
+		legacyLimit := NoLimit
+		if session != nil && session.Server != nil && session.disablePortalSuspension {
+			legacyLimit = limit
+			limit = NoLimit // Row enforces the limit; never leave the handler suspended.
+		}
 		// Create a simple push-style iterator (iter.Seq) around the
 		// statement.fn.
 		seq := func(yield func(struct{}) bool) {
@@ -164,6 +169,7 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 				client:  writer,
 				yield:   yield,
 				tag:     &p.tag,
+				limit:   legacyLimit,
 			}
 			p.writer = dw
 			err := p.statement.fn(ctx, dw, p.parameters)

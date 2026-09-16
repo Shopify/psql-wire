@@ -146,7 +146,9 @@ type Server struct {
 	ShutdownTimeout  time.Duration
 	typeExtension    func(*pgtype.Map)
 	encodeObserver   EncodeObserver
-	closer           chan struct{}
+	// Compatibility for embedders whose execution leases cannot be suspended.
+	disablePortalSuspension bool
+	closer                  chan struct{}
 }
 
 // ListenAndServe opens a new Postgres server on the preconfigured address and
