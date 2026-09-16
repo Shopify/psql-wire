@@ -338,6 +338,9 @@ func (srv *Session) handleSimpleQuery(ctx context.Context, reader *buffer.Reader
 func (srv *Session) handleParse(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer) error {
 	if srv.parse == nil || srv.Statements == nil {
 		err := NewErrUnimplementedMessageType(types.ClientParse)
+		if srv.ParallelPipeline.Enabled {
+			return srv.drainQueueAndWriteError(ctx, writer, err)
+		}
 		return srv.WriteError(writer, err)
 	}
 
@@ -682,6 +685,9 @@ func (srv *Session) readColumnTypes(reader *buffer.Reader) ([]FormatCode, error)
 func (srv *Session) handleExecute(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer) error {
 	if srv.Statements == nil {
 		err := NewErrUnimplementedMessageType(types.ClientExecute)
+		if srv.ParallelPipeline.Enabled {
+			return srv.drainQueueAndWriteError(ctx, writer, err)
+		}
 		return srv.WriteError(writer, err)
 	}
 
@@ -826,8 +832,7 @@ func (srv *Session) processResponseQueue(ctx context.Context, writer *buffer.Wri
 	}
 
 	if queueErr != nil {
-		// Write ErrorResponse without ReadyForQuery — handleSync sends that.
-		if err := WriteUnterminatedError(writer, queueErr); err != nil {
+		if err := srv.WriteError(writer, queueErr); err != nil {
 			return err
 		}
 	}
@@ -862,8 +867,7 @@ func (srv *Session) drainQueueOnError(ctx context.Context, writer *buffer.Writer
 	srv.ResponseQueue.Clear()
 
 	if queueErr != nil {
-		// Write ErrorResponse without ReadyForQuery — the caller handles that.
-		return WriteUnterminatedError(writer, queueErr)
+		return srv.WriteError(writer, queueErr)
 	}
 
 	return nil
@@ -932,7 +936,7 @@ func (srv *Session) writeQueuedResponse(ctx context.Context, writer *buffer.Writ
 		// Check for execution error — write ErrorResponse only, no ReadyForQuery.
 		// The caller (processResponseQueue → handleSync) sends ReadyForQuery.
 		if err := event.Result.GetError(); err != nil {
-			return WriteUnterminatedError(writer, err)
+			return srv.WriteError(writer, err)
 		}
 
 		// Use DataWriter for correct encoding
