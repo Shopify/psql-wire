@@ -90,6 +90,9 @@ type Portal struct {
 	// The iterator state (created by iter.Pull)
 	next func() (struct{}, bool)
 	stop func()
+	// The handler survives suspension, but parallel Executes have distinct
+	// output buffers. Rebind its writer before each sequential resume.
+	writer *dataWriter
 	// Filled in by dataWriter.Complete when the handler finishes. Used to
 	// return the tag when re-executing a completed portal.
 	tag string
@@ -126,6 +129,7 @@ func (p *Portal) close() {
 		p.stop()
 		p.next = nil
 		p.stop = nil
+		p.writer = nil
 	}
 }
 
@@ -161,6 +165,7 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 				yield:   yield,
 				tag:     &p.tag,
 			}
+			p.writer = dw
 			err := p.statement.fn(ctx, dw, p.parameters)
 			if err != nil && !errors.Is(err, ErrSuspendedHandlerClosed) {
 				p.err = err
@@ -170,6 +175,9 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 		// Then we convert that push-style iterator into a pull-style iterator,
 		// so we can suspend the iterator when we reach the row limit.
 		p.next, p.stop = iter.Pull(seq)
+	} else {
+		p.writer.client = writer
+		p.writer.reader = reader
 	}
 
 	var count Limit
