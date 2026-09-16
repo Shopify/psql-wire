@@ -90,10 +90,16 @@ func TestCompatibilityBindDescribeErrorRecovery(t *testing.T) {
 
 func TestParallelResponseOrderUsesPortalIdentity(t *testing.T) {
 	secondFinished := make(chan struct{})
+	abort := make(chan struct{})
+	defer close(abort) // release A before server cleanup if B never starts
 	conn := compatibilityClient(t, func(_ context.Context, query string) (PreparedStatements, error) {
 		return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) error {
 			if query == "A" {
-				<-secondFinished
+				select {
+				case <-secondFinished:
+				case <-abort:
+					return context.Canceled
+				}
 			} else {
 				defer close(secondFinished)
 			}
