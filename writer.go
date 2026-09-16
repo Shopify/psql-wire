@@ -61,6 +61,9 @@ var ErrClosedWriter = errors.New("closed writer")
 // ErrRowLimitExceeded is returned only when portal suspension is disabled.
 var ErrRowLimitExceeded = pgerror.WithCode(errors.New("row limit exceeded"), codes.ProgramLimitExceeded)
 
+// Bound per-writer encoding scratch so a single large value is not retained.
+const maxEncodeScratchCapacity = 64 * 1024
+
 // dataWriter implements DataWriter for use inside an iter.Seq push
 // iterator. Row encodes the row to the wire and then yields to the pull
 // consumer for flow control. Complete writes CommandComplete to the wire.
@@ -79,6 +82,10 @@ type dataWriter struct {
 	closed  bool
 	written uint32
 	limit   Limit // legacy fail-at-limit mode; zero means no limit
+
+	// Owned by this writer, which is not safe for concurrent use. Sequential
+	// DataRow writes and parallel executeAsync pre-encode both call Row.
+	encodeScratch []byte
 }
 
 func (writer *dataWriter) Columns() Columns {
@@ -98,7 +105,7 @@ func (writer *dataWriter) Row(values []any) error {
 		return ErrRowLimitExceeded
 	}
 
-	err := writer.columns.Write(writer.ctx, writer.formats, writer.client, values)
+	err := writer.columns.write(writer.ctx, writer.formats, writer.client, values, &writer.encodeScratch)
 	if err != nil {
 		return err
 	}
@@ -154,6 +161,7 @@ func (writer *dataWriter) Complete(description string) error {
 
 func (writer *dataWriter) close() {
 	writer.closed = true
+	writer.encodeScratch = nil
 }
 
 // commandComplete announces that the requested command has successfully been executed.
