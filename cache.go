@@ -147,7 +147,9 @@ func (cache *DefaultPortalCache) Execute(ctx context.Context, name string, limit
 	}
 
 	session, _ := GetSession(ctx)
-	return portal.statement.fn(ctx, NewDataWriter(ctx, session, portal.statement.columns, portal.formats, limit, reader, writer), portal.parameters)
+	dataWriter := newDataWriter(ctx, session, portal.statement.columns, portal.formats, limit, reader, writer)
+	defer dataWriter.flushEncodeObservations()
+	return portal.statement.fn(ctx, dataWriter, portal.parameters)
 }
 
 func (cache *DefaultPortalCache) Delete(ctx context.Context, name string) error {

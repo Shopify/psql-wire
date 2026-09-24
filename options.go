@@ -301,21 +301,19 @@ func ExtendTypes(fn func(*pgtype.Map)) OptionFn {
 	}
 }
 
-// EncodeObserver is invoked once per column value successfully encoded for a
-// DataRow. It receives the wire format the column was encoded with, the
-// Postgres OID of the column type, and the number of bytes written for that
-// value. It is called on the per-row hot path; implementations should be
-// allocation-free and non-blocking.
+// EncodeObserver observes successfully encoded non-NULL column values. Calls
+// may aggregate multiple values from the same result column and format. Count
+// is the number of encoded values represented by the call, and encodedBytes is
+// their combined encoded size.
 //
-// NULL values (src == nil) are not reported. The observer must not retain ctx
-// or mutate any of its arguments. The same context that was used to encode the
-// value is passed through so observers can read connection-scoped metadata
+// The observer must not retain ctx. The same context that was used to encode
+// the values is passed through so observers can read connection-scoped metadata
 // (e.g. via SessionMiddleware) without additional plumbing.
-type EncodeObserver func(ctx context.Context, format FormatCode, oid uint32, n int)
+type EncodeObserver func(ctx context.Context, format FormatCode, oid uint32, count uint64, encodedBytes uint64)
 
 // WithEncodeObserver installs an [EncodeObserver] on the server. The observer
-// is invoked once per encoded column value (excluding NULLs) on every
-// connection. Passing a nil observer is a no-op.
+// is invoked for encoded column values (excluding NULLs) on every connection.
+// Passing a nil observer is a no-op.
 func WithEncodeObserver(obs EncodeObserver) OptionFn {
 	return func(srv *Server) error {
 		srv.encodeObserver = obs

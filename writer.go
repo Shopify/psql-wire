@@ -75,7 +75,11 @@ var ErrRowLimitExceeded = pgerror.WithCode(errors.New("row limit exceeded"), cod
 // for concurrent use. Concurrent access to the same data without proper
 // synchronization can result in unexpected behavior and data corruption.
 func NewDataWriter(ctx context.Context, session *Session, columns Columns, formats []FormatCode, limit Limit, reader *buffer.Reader, writer *buffer.Writer) DataWriter {
-	return &dataWriter{
+	return newDataWriter(ctx, session, columns, formats, limit, reader, writer)
+}
+
+func newDataWriter(ctx context.Context, session *Session, columns Columns, formats []FormatCode, limit Limit, reader *buffer.Reader, writer *buffer.Writer) *dataWriter {
+	dataWriter := &dataWriter{
 		ctx:     ctx,
 		session: session,
 		columns: columns,
@@ -84,6 +88,11 @@ func NewDataWriter(ctx context.Context, session *Session, columns Columns, forma
 		client:  writer,
 		reader:  reader,
 	}
+	dataWriter.encodeObserver = EncodeObserverFromContext(ctx)
+	if dataWriter.encodeObserver != nil {
+		dataWriter.encodeStats = make([]encodeStats, len(columns))
+	}
+	return dataWriter
 }
 
 // dataWriter is a implementation of the DataWriter interface.
@@ -97,6 +106,9 @@ type dataWriter struct {
 	reader  *buffer.Reader
 	closed  bool
 	written uint32
+
+	encodeObserver EncodeObserver
+	encodeStats    []encodeStats
 }
 
 func (writer *dataWriter) Columns() Columns {
@@ -127,7 +139,10 @@ func (writer *dataWriter) Row(values []any) error {
 
 	writer.written++
 
-	return writer.columns.Write(writer.ctx, writer.formats, writer.client, values)
+	if writer.encodeObserver == nil {
+		return writer.columns.Write(writer.ctx, writer.formats, writer.client, values)
+	}
+	return writer.columns.write(writer.ctx, writer.formats, writer.client, values, writer.encodeStats)
 }
 
 func (writer *dataWriter) CopyIn(format FormatCode) (*CopyReader, error) {
@@ -182,6 +197,27 @@ func (writer *dataWriter) Complete(description string) error {
 
 func (writer *dataWriter) close() {
 	writer.closed = true
+	writer.flushEncodeObservations()
+}
+
+func (writer *dataWriter) flushEncodeObservations() {
+	if writer.encodeObserver == nil || writer.encodeStats == nil {
+		return
+	}
+	for index, stat := range writer.encodeStats {
+		if stat.count == 0 {
+			continue
+		}
+		format := TextFormat
+		if len(writer.formats) > 0 {
+			format = writer.formats[0]
+			if len(writer.formats) > index {
+				format = writer.formats[index]
+			}
+		}
+		writer.encodeObserver(writer.ctx, format, uint32(writer.columns[index].Oid), stat.count, stat.encodedBytes)
+	}
+	writer.encodeStats = nil
 }
 
 // commandComplete announces that the requested command has successfully been executed.

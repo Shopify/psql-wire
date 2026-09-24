@@ -4,11 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
 	"github.com/lib/pq"
 	"github.com/lib/pq/oid"
 	"github.com/neilotoole/slogt"
@@ -17,9 +22,10 @@ import (
 )
 
 type observerEntry struct {
-	format FormatCode
-	oid    uint32
-	n      int
+	format       FormatCode
+	oid          uint32
+	count        uint64
+	encodedBytes uint64
 }
 
 type recordingObserver struct {
@@ -27,10 +33,10 @@ type recordingObserver struct {
 	entries []observerEntry
 }
 
-func (r *recordingObserver) observe(_ context.Context, format FormatCode, columnOID uint32, n int) {
+func (r *recordingObserver) observe(_ context.Context, format FormatCode, columnOID uint32, count uint64, encodedBytes uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.entries = append(r.entries, observerEntry{format: format, oid: columnOID, n: n})
+	r.entries = append(r.entries, observerEntry{format: format, oid: columnOID, count: count, encodedBytes: encodedBytes})
 }
 
 func (r *recordingObserver) snapshot() []observerEntry {
@@ -91,15 +97,63 @@ func TestEncodeObserverTextFormat(t *testing.T) {
 	require.NoError(t, rows.Close())
 
 	entries := rec.snapshot()
-	require.Len(t, entries, 4, "expected 2 columns x 2 rows = 4 entries")
+	require.Len(t, entries, 2, "expected one aggregated entry per column")
 
-	for _, e := range entries {
-		assert.Equal(t, TextFormat, e.format, "lib/pq uses simple query protocol which encodes as text")
-		assert.Greater(t, e.n, 0)
-	}
-
+	assert.Equal(t, TextFormat, entries[0].format, "lib/pq uses simple query protocol which encodes as text")
 	assert.Equal(t, uint32(oid.T_text), entries[0].oid)
+	assert.Equal(t, uint64(2), entries[0].count)
+	assert.Equal(t, uint64(8), entries[0].encodedBytes)
+	assert.Equal(t, TextFormat, entries[1].format)
 	assert.Equal(t, uint32(oid.T_int4), entries[1].oid)
+	assert.Equal(t, uint64(2), entries[1].count)
+	assert.Equal(t, uint64(4), entries[1].encodedBytes)
+}
+
+func BenchmarkEncodeObserver(b *testing.B) {
+	columns := Columns{
+		{Name: "id", Oid: oid.T_int8, Width: 8},
+		{Name: "value", Oid: oid.T_text, Width: 256},
+	}
+	values := []any{int64(42), "benchmark"}
+
+	for _, observed := range []bool{false, true} {
+		name := "disabled"
+		if observed {
+			name = "enabled"
+		}
+		b.Run(name, func(b *testing.B) {
+			ctx := setTypeInfo(context.Background(), pgtype.NewMap())
+			var observedValues atomic.Uint64
+			var observedBytes atomic.Uint64
+			if observed {
+				ctx = setEncodeObserver(ctx, func(_ context.Context, _ FormatCode, _ uint32, count uint64, encodedBytes uint64) {
+					observedValues.Add(count)
+					observedBytes.Add(encodedBytes)
+				})
+			}
+			client := buffer.NewWriter(slog.New(slog.NewTextHandler(io.Discard, nil)), io.Discard)
+
+			b.ReportAllocs()
+			for b.Loop() {
+				writer := NewDataWriter(ctx, nil, columns, nil, NoLimit, nil, client)
+				for range 10_000 {
+					if err := writer.Row(values); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := writer.Complete("SELECT 10000"); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			if observed {
+				want := uint64(20_000 * b.N)
+				if observedValues.Load() != want {
+					b.Fatalf("observed %d values, want %d", observedValues.Load(), want)
+				}
+			}
+		})
+	}
 }
 
 func TestEncodeObserverBinaryFormat(t *testing.T) {
@@ -123,12 +177,14 @@ func TestEncodeObserverBinaryFormat(t *testing.T) {
 	require.NoError(t, result.Err)
 
 	entries := rec.snapshot()
-	require.Len(t, entries, 4, "expected 2 columns x 2 rows = 4 entries")
+	require.Len(t, entries, 2, "expected one aggregated entry per column")
 
-	for _, e := range entries {
-		assert.Equal(t, BinaryFormat, e.format, "client requested binary format for both columns")
-		assert.Greater(t, e.n, 0)
-	}
+	assert.Equal(t, BinaryFormat, entries[0].format, "client requested binary format for both columns")
+	assert.Equal(t, uint64(2), entries[0].count)
+	assert.Equal(t, uint64(8), entries[0].encodedBytes)
+	assert.Equal(t, BinaryFormat, entries[1].format)
+	assert.Equal(t, uint64(2), entries[1].count)
+	assert.Equal(t, uint64(8), entries[1].encodedBytes)
 }
 
 // TestEncodeObserverPgxDefault documents and pins pgx v5's default
@@ -174,15 +230,15 @@ func TestEncodeObserverPgxDefault(t *testing.T) {
 	rows.Close()
 
 	entries := rec.snapshot()
-	require.Len(t, entries, 4)
+	require.Len(t, entries, 2)
 
-	// Two rows × {text-column, int4-column}. Per-row order is preserved.
+	// Two rows aggregated into one observation per result column.
 	assert.Equal(t, TextFormat, entries[0].format, "name (text) → pgx prefers text")
 	assert.Equal(t, uint32(oid.T_text), entries[0].oid)
+	assert.Equal(t, uint64(2), entries[0].count)
 	assert.Equal(t, BinaryFormat, entries[1].format, "age (int4) → pgx prefers binary")
 	assert.Equal(t, uint32(oid.T_int4), entries[1].oid)
-	assert.Equal(t, TextFormat, entries[2].format)
-	assert.Equal(t, BinaryFormat, entries[3].format)
+	assert.Equal(t, uint64(2), entries[1].count)
 }
 
 func TestEncodeObserverNotInstalled(t *testing.T) {
@@ -247,6 +303,7 @@ func TestEncodeObserverSkipsNullValues(t *testing.T) {
 	entries := rec.snapshot()
 	require.Len(t, entries, 1, "NULL values must not be observed")
 	assert.Equal(t, uint32(oid.T_text), entries[0].oid)
+	assert.Equal(t, uint64(1), entries[0].count)
 }
 
 func TestDataWriterFormats(t *testing.T) {

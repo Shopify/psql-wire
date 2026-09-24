@@ -327,7 +327,9 @@ func (srv *Session) handleSimpleQuery(ctx context.Context, reader *buffer.Reader
 			return srv.WriteError(writer, err)
 		}
 
-		err = statements[index].fn(ctx, NewDataWriter(ctx, srv, statements[index].columns, nil, NoLimit, reader, writer), nil)
+		dataWriter := newDataWriter(ctx, srv, statements[index].columns, nil, NoLimit, reader, writer)
+		err = statements[index].fn(ctx, dataWriter, nil)
+		dataWriter.flushEncodeObservations()
 		if err != nil {
 			return srv.WriteError(writer, err)
 		}
@@ -938,8 +940,8 @@ func (srv *Session) writeQueuedResponse(ctx context.Context, writer *buffer.Writ
 
 		// Use DataWriter for correct encoding
 		// Note: We use NoLimit here because the result is already limited during execution
-		dataWriter := NewDataWriter(ctx, srv, event.Result.Columns(), event.Formats, NoLimit, nil, writer)
-
+		dataWriter := newDataWriter(ctx, srv, event.Result.Columns(), event.Formats, NoLimit, nil, writer)
+		defer dataWriter.flushEncodeObservations()
 		return event.Result.Replay(ctx, dataWriter)
 
 	default:
