@@ -171,7 +171,11 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 				tag:     &p.tag,
 				limit:   legacyLimit,
 			}
+			dw.observeEncoding()
 			p.writer = dw
+			// Publish values encoded before the handler returned an error or
+			// was torn down. Complete and Empty flush on their own.
+			defer dw.flushEncodeObservations()
 			err := p.statement.fn(ctx, dw, p.parameters)
 			if err != nil && !errors.Is(err, ErrSuspendedHandlerClosed) {
 				p.err = err

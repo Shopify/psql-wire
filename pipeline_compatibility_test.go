@@ -79,11 +79,9 @@ func TestPipelineSuspensionPreservesRowsAndObservation(t *testing.T) {
 					require.Equal(t, "SELECT 5", tag)
 				}
 			}
-			entries := rec.snapshot()
-			require.Len(t, entries, 5)
-			for _, e := range entries {
-				require.Equal(t, observerEntry{format: BinaryFormat, oid: pgtype.Int4OID, n: 4}, e)
-			}
+			require.Equal(t, []observerEntry{
+				{format: BinaryFormat, oid: pgtype.Int4OID, count: 5, encodedBytes: 20},
+			}, rec.snapshot())
 		})
 	}
 }
