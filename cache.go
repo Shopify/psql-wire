@@ -173,8 +173,8 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 			}
 			dw.observeEncoding()
 			p.writer = dw
-			// Publish values encoded before the handler returned an error or
-			// was torn down. Complete and Empty flush on their own.
+			// Publish values encoded before an error, panic, or teardown of a
+			// suspended handler. Complete and Empty flush on their own.
 			defer dw.flushEncodeObservations()
 			err := p.statement.fn(ctx, dw, p.parameters)
 			if err != nil && !errors.Is(err, ErrSuspendedHandlerClosed) {
@@ -195,7 +195,9 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 		if limit != NoLimit && count >= limit {
 			// We've reached the row limit. Suspend the portal and let the
 			// client know, so it can either issue a new Execute to continue or
-			// close the portal.
+			// close the portal. The handler is parked in yield, so this
+			// goroutine owns its writer and publishes this Execute's values.
+			p.writer.flushEncodeObservations()
 			return portalSuspended(writer)
 		}
 

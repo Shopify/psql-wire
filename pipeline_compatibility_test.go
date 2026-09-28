@@ -15,6 +15,8 @@ import (
 
 // Exercise the public Execute/Sync boundary: a resumed parallel portal must
 // write into this Execute's response buffer, not the buffer already replayed.
+// Encode observations are published at each Execute boundary: once when the
+// portal suspends and once when it completes, each covering only its rows.
 func TestPipelineSuspensionPreservesRowsAndObservation(t *testing.T) {
 	for _, parallel := range []bool{false, true} {
 		t.Run(fmt.Sprint(parallel), func(t *testing.T) {
@@ -73,6 +75,9 @@ func TestPipelineSuspensionPreservesRowsAndObservation(t *testing.T) {
 					require.Equal(t, [][]byte{{0, 0, 0, 0}, {0, 0, 0, 1}}, rows)
 					require.True(t, suspended)
 					require.Empty(t, tag)
+					require.Equal(t, []observerEntry{
+						{format: BinaryFormat, oid: pgtype.Int4OID, count: 2, encodedBytes: 8},
+					}, rec.snapshot(), "suspension publishes the rows sent by this Execute")
 				} else {
 					require.Equal(t, [][]byte{{0, 0, 0, 2}, {0, 0, 0, 3}, {0, 0, 0, 4}}, rows)
 					require.False(t, suspended)
@@ -80,8 +85,9 @@ func TestPipelineSuspensionPreservesRowsAndObservation(t *testing.T) {
 				}
 			}
 			require.Equal(t, []observerEntry{
-				{format: BinaryFormat, oid: pgtype.Int4OID, count: 5, encodedBytes: 20},
-			}, rec.snapshot())
+				{format: BinaryFormat, oid: pgtype.Int4OID, count: 2, encodedBytes: 8},
+				{format: BinaryFormat, oid: pgtype.Int4OID, count: 3, encodedBytes: 12},
+			}, rec.snapshot(), "completion publishes only rows encoded after the suspension")
 		})
 	}
 }

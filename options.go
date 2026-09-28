@@ -328,6 +328,14 @@ func ExtendTypes(fn func(*pgtype.Map)) OptionFn {
 // is the number of encoded values represented by the call, and encodedBytes is
 // their combined encoded size.
 //
+// Rows written through a statement's DataWriter are aggregated per column and
+// published at each Execute boundary: when the portal suspends at the client's
+// row limit, and when the handler completes, returns an error, or is torn
+// down. Each value is reported exactly once, when it is encoded, even if the
+// response is later discarded (for example, a failed parallel Execute).
+// Direct [Columns.Write] and [Column.Write] calls report each value
+// immediately.
+//
 // The observer must not retain ctx. The same context that was used to encode
 // the values is passed through so observers can read connection-scoped metadata
 // (e.g. via SessionMiddleware) without additional plumbing.

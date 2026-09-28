@@ -82,8 +82,8 @@ type dataWriter struct {
 
 	// encodeObserver is captured from ctx when the handler starts. While it
 	// is set, Row accumulates per-column totals in encodeStats instead of
-	// calling the observer per value. They are published when the writer
-	// closes or the handler returns.
+	// calling the observer per value. Portal.execute publishes them at every
+	// Execute boundary: suspension, completion, handler error and teardown.
 	encodeObserver EncodeObserver
 	encodeStats    []encodeStats
 }
@@ -114,7 +114,8 @@ func (writer *dataWriter) Row(values []any) error {
 		return ErrRowLimitExceeded
 	}
 
-	err := writer.columns.write(writer.ctx, writer.formats, writer.client, values, writer.encodeStats)
+	// No per-value observer: encodeStats is published at Execute boundaries.
+	err := writer.columns.write(writer.ctx, writer.formats, writer.client, values, nil, writer.encodeStats)
 	if err != nil {
 		return err
 	}
@@ -175,7 +176,8 @@ func (writer *dataWriter) close() {
 
 // flushEncodeObservations publishes the accumulated per-column totals and
 // resets them, so each call reports only values encoded since the previous
-// one. It runs on the handler goroutine.
+// one. It must run on the goroutine that owns the handler: either the handler
+// itself or Portal.execute while the handler is parked in yield.
 func (writer *dataWriter) flushEncodeObservations() {
 	if writer.encodeObserver == nil {
 		return
