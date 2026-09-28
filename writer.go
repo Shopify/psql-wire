@@ -79,6 +79,22 @@ type dataWriter struct {
 	closed  bool
 	written uint32
 	limit   Limit // legacy fail-at-limit mode; zero means no limit
+
+	// encodeObserver is captured from ctx when the handler starts. While it
+	// is set, Row accumulates per-column totals in encodeStats instead of
+	// calling the observer per value. Portal.execute publishes them at every
+	// Execute boundary: suspension, completion, handler error and teardown.
+	encodeObserver EncodeObserver
+	encodeStats    []encodeStats
+}
+
+// observeEncoding enables aggregated encode observation when the context
+// carries an EncodeObserver.
+func (writer *dataWriter) observeEncoding() {
+	writer.encodeObserver = EncodeObserverFromContext(writer.ctx)
+	if writer.encodeObserver != nil {
+		writer.encodeStats = make([]encodeStats, len(writer.columns))
+	}
 }
 
 func (writer *dataWriter) Columns() Columns {
@@ -98,7 +114,8 @@ func (writer *dataWriter) Row(values []any) error {
 		return ErrRowLimitExceeded
 	}
 
-	err := writer.columns.Write(writer.ctx, writer.formats, writer.client, values)
+	// No per-value observer: encodeStats is published at Execute boundaries.
+	err := writer.columns.write(writer.ctx, writer.formats, writer.client, values, nil, writer.encodeStats)
 	if err != nil {
 		return err
 	}
@@ -148,12 +165,41 @@ func (writer *dataWriter) Complete(description string) error {
 	}
 
 	defer writer.close()
+	// Publish before the client can observe completion.
+	writer.flushEncodeObservations()
 	*writer.tag = description
 	return commandComplete(writer.client, description)
 }
 
 func (writer *dataWriter) close() {
 	writer.closed = true
+	writer.flushEncodeObservations()
+}
+
+// flushEncodeObservations publishes the accumulated per-column totals and
+// resets them, so each call reports only values encoded since the previous
+// one. It must run on the goroutine that owns the handler: either the handler
+// itself or Portal.execute while the handler is parked in yield.
+func (writer *dataWriter) flushEncodeObservations() {
+	if writer.encodeObserver == nil {
+		return
+	}
+	for index := range writer.encodeStats {
+		stat := writer.encodeStats[index]
+		if stat.count == 0 {
+			continue
+		}
+		writer.encodeStats[index] = encodeStats{}
+
+		format := TextFormat
+		if len(writer.formats) > 0 {
+			format = writer.formats[0]
+			if len(writer.formats) > index {
+				format = writer.formats[index]
+			}
+		}
+		writer.encodeObserver(writer.ctx, format, writer.columns[index].Oid, stat.count, stat.encodedBytes)
+	}
 }
 
 // commandComplete announces that the requested command has successfully been executed.

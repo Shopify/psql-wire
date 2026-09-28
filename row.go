@@ -71,6 +71,13 @@ func (columns Columns) CopyIn(ctx context.Context, writer *buffer.Writer, format
 // Binary. If you provide a single format code, it will be applied to all
 // columns.
 func (columns Columns) Write(ctx context.Context, formats []FormatCode, writer *buffer.Writer, srcs []any) (err error) {
+	return columns.write(ctx, formats, writer, srcs, EncodeObserverFromContext(ctx), nil)
+}
+
+// write encodes a DataRow. Encode observations of non-NULL values accumulate
+// in stats when it is set, for the owning dataWriter to publish later;
+// otherwise observer, when set, is called for each value immediately.
+func (columns Columns) write(ctx context.Context, formats []FormatCode, writer *buffer.Writer, srcs []any, observer EncodeObserver, stats []encodeStats) (err error) {
 	if len(srcs) != len(columns) {
 		return fmt.Errorf("unexpected columns, %d columns are defined inside the given table but %d were given", len(columns), len(srcs))
 	}
@@ -88,7 +95,11 @@ func (columns Columns) Write(ctx context.Context, formats []FormatCode, writer *
 			format = formats[index]
 		}
 
-		err = column.Write(ctx, writer, format, srcs[index])
+		var stat *encodeStats
+		if len(stats) > index {
+			stat = &stats[index]
+		}
+		err = column.write(ctx, writer, format, srcs[index], observer, stat)
 		if err != nil {
 			return err
 		}
@@ -147,6 +158,10 @@ func (column Column) Define(ctx context.Context, writer *buffer.Writer, format F
 //
 // [DataRow]: https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-DATAROW
 func (column Column) Write(ctx context.Context, writer *buffer.Writer, format FormatCode, src any) (err error) {
+	return column.write(ctx, writer, format, src, EncodeObserverFromContext(ctx), nil)
+}
+
+func (column Column) write(ctx context.Context, writer *buffer.Writer, format FormatCode, src any, observer EncodeObserver, stat *encodeStats) (err error) {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -174,10 +189,18 @@ func (column Column) Write(ctx context.Context, writer *buffer.Writer, format Fo
 	writer.AddBytes(bb)
 
 	if src != nil {
-		if obs := EncodeObserverFromContext(ctx); obs != nil {
-			obs(ctx, format, uint32(column.Oid), len(bb))
+		if stat != nil {
+			stat.count++
+			stat.encodedBytes += uint64(len(bb))
+		} else if observer != nil {
+			observer(ctx, format, column.Oid, 1, uint64(len(bb)))
 		}
 	}
 
 	return nil
+}
+
+type encodeStats struct {
+	count        uint64
+	encodedBytes uint64
 }
