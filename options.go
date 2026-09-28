@@ -331,8 +331,9 @@ func ExtendTypes(fn func(*pgtype.Map)) OptionFn {
 // Rows written through a statement's DataWriter are aggregated per column and
 // published at each Execute boundary: when the portal suspends at the client's
 // row limit, and when the handler completes, returns an error, or is torn
-// down. Each value is reported exactly once, when it is encoded, even if the
-// response is later discarded (for example, a failed parallel Execute).
+// down, before that Execute's PortalSuspended, CommandComplete or error is
+// written. Each value is reported exactly once, when it is encoded, even if
+// the response is later discarded (for example, a failed parallel Execute).
 // Direct [Columns.Write] and [Column.Write] calls report each value
 // immediately.
 //
