@@ -232,6 +232,8 @@ func (writer *dataWriter) Complete(description string) error {
 	}
 
 	defer writer.close()
+	// Publish before the client can observe completion.
+	writer.flushEncodeObservations()
 	*writer.tag = description
 	return commandComplete(writer.client, description)
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
+	"github.com/jeroenrinzema/psql-wire/pkg/types"
 	"github.com/stretchr/testify/require"
 )
 
@@ -326,4 +327,43 @@ func readObserverBatch(t *testing.T, f *pgproto3.Frontend, untilSuspended bool) 
 			return result
 		}
 	}
+}
+
+// observedAtFrame records how many observations were published when each
+// completion or suspension frame reached the connection.
+type observedAtFrame struct {
+	rec      *recordingObserver
+	complete []int
+}
+
+func (w *observedAtFrame) Write(p []byte) (int, error) {
+	if p[0] == byte(types.ServerCommandComplete) || p[0] == byte(types.ServerPortalSuspended) {
+		w.complete = append(w.complete, len(w.rec.snapshot()))
+	}
+	return len(p), nil
+}
+
+func TestEncodeObserverPublishesBeforeClientSeesBoundary(t *testing.T) {
+	rec := &recordingObserver{}
+	ctx := setEncodeObserver(setTypeInfo(context.Background(), pgtype.NewMap()), rec.observe)
+	out := &observedAtFrame{rec: rec}
+	writer := buffer.NewWriter(slog.New(slog.NewTextHandler(io.Discard, nil)), out)
+	portal := &Portal{statement: &Statement{
+		columns: Columns{{Name: "value", Oid: pgtype.TextOID}},
+		fn: func(_ context.Context, w DataWriter, _ []Parameter) error {
+			for i := 0; i < 3; i++ {
+				if err := w.Row([]any{"row"}); err != nil {
+					return err
+				}
+			}
+			return w.Complete("SELECT 3")
+		},
+	}}
+	defer portal.Close()
+	require.NoError(t, portal.execute(ctx, 2, nil, writer))
+	require.NoError(t, portal.execute(ctx, 2, nil, writer))
+	// A client that reads PortalSuspended or CommandComplete can already see
+	// the observations for the rows before it.
+	require.Equal(t, []int{1, 2}, out.complete)
+	require.Equal(t, []observerEntry{textObservation(2, 6), textObservation(1, 3)}, rec.snapshot())
 }
