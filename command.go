@@ -98,7 +98,11 @@ func (srv *Session) consumeCommands(ctx context.Context, conn net.Conn, reader *
 	srv.reader = reader
 	srv.logger.Debug("ready for query... starting to consume commands")
 
-	err := readyForQuery(writer, types.ServerIdle)
+	// The very first ReadyForQuery is sent before any statement has run, so
+	// the session is always idle here. We still go through readyForQuery so a
+	// configured TxStatus callback gets a consistent signal that
+	// ReadyForQuery is about to be sent.
+	err := srv.readyForQuery(ctx, writer)
 	if err != nil {
 		return err
 	}
@@ -122,7 +126,7 @@ func (srv *Session) consumeSingleCommand(ctx context.Context, reader *buffer.Rea
 
 	// NOTE: we could recover from this scenario
 	if errors.Is(err, buffer.ErrMessageSizeExceeded) {
-		err = srv.handleMessageSizeExceeded(reader, writer, err)
+		err = srv.handleMessageSizeExceeded(ctx, reader, writer, err)
 		if err != nil {
 			return err
 		}
@@ -162,7 +166,7 @@ func (srv *Session) consumeSingleCommand(ctx context.Context, reader *buffer.Rea
 // type. A fatal error is returned when an unexpected error is returned while
 // consuming the expected message size or when attempting to write the error
 // message back to the client.
-func (srv *Session) handleMessageSizeExceeded(reader *buffer.Reader, writer *buffer.Writer, exceeded error) (err error) {
+func (srv *Session) handleMessageSizeExceeded(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer, exceeded error) (err error) {
 	unwrapped, has := buffer.UnwrapMessageSizeExceeded(exceeded)
 	if !has {
 		return exceeded
@@ -173,7 +177,7 @@ func (srv *Session) handleMessageSizeExceeded(reader *buffer.Reader, writer *buf
 		return err
 	}
 
-	return srv.WriteError(writer, exceeded)
+	return srv.WriteError(ctx, writer, exceeded)
 }
 
 // handleCommand handles the given client message. A client message includes a
@@ -285,13 +289,13 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 
 		return io.EOF
 	default:
-		return srv.WriteError(writer, NewErrUnimplementedMessageType(t))
+		return srv.WriteError(ctx, writer, NewErrUnimplementedMessageType(t))
 	}
 }
 
 func (srv *Session) handleSimpleQuery(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer) error {
 	if srv.parse == nil {
-		return srv.WriteError(writer, NewErrUnimplementedMessageType(types.ClientSimpleQuery))
+		return srv.WriteError(ctx, writer, NewErrUnimplementedMessageType(types.ClientSimpleQuery))
 	}
 
 	query, err := reader.GetString()
@@ -312,23 +316,23 @@ func (srv *Session) handleSimpleQuery(ctx context.Context, reader *buffer.Reader
 			return err
 		}
 
-		return readyForQuery(writer, types.ServerIdle)
+		return srv.readyForQuery(ctx, writer)
 	}
 
-	statements, err := srv.parse(ctx, query)
+	statements, err := srv.parse(ctx, Query{Query: query, SimpleQuery: true})
 	if err != nil {
-		return srv.WriteError(writer, err)
+		return srv.WriteError(ctx, writer, err)
 	}
 
 	if len(statements) == 0 {
-		return srv.WriteError(writer, NewErrUndefinedStatement())
+		return srv.WriteError(ctx, writer, NewErrUndefinedStatement())
 	}
 
 	// NOTE: it is possible to send multiple statements in one simple query.
 	for index := range statements {
 		err = statements[index].columns.Define(ctx, writer, nil)
 		if err != nil {
-			return srv.WriteError(writer, err)
+			return srv.WriteError(ctx, writer, err)
 		}
 
 		portal := &Portal{
@@ -339,11 +343,11 @@ func (srv *Session) handleSimpleQuery(ctx context.Context, reader *buffer.Reader
 		}
 		err = portal.execute(ctx, NoLimit, reader, writer)
 		if err != nil {
-			return srv.WriteError(writer, err)
+			return srv.WriteError(ctx, writer, err)
 		}
 	}
 
-	return readyForQuery(writer, types.ServerIdle)
+	return srv.readyForQuery(ctx, writer)
 }
 
 func (srv *Session) handleParse(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer) error {
@@ -352,7 +356,7 @@ func (srv *Session) handleParse(ctx context.Context, reader *buffer.Reader, writ
 		if srv.ParallelPipeline.Enabled {
 			return srv.drainQueueAndWriteError(ctx, writer, err)
 		}
-		return srv.WriteError(writer, err)
+		return srv.WriteError(ctx, writer, err)
 	}
 
 	name, err := reader.GetString()
@@ -376,12 +380,15 @@ func (srv *Session) handleParse(ctx context.Context, reader *buffer.Reader, writ
 
 	srv.logger.Debug("predefined parameters", slog.Int("parameters", int(parameters)))
 
+	parameterOIDs := make([]uint32, parameters)
 	for i := uint16(0); i < parameters; i++ {
-		// TODO: Specifies the object ID of the parameter data type
-		//
 		// Specifies the object ID of the parameter data type. Placing a zero here
 		// is equivalent to leaving the type unspecified.
-		// `reader.GetUint32()`
+		oid, err := reader.GetUint32()
+		if err != nil {
+			return err
+		}
+		parameterOIDs[i] = oid
 	}
 
 	existing, err := srv.Statements.Get(ctx, name)
@@ -389,7 +396,7 @@ func (srv *Session) handleParse(ctx context.Context, reader *buffer.Reader, writ
 		if srv.ParallelPipeline.Enabled {
 			return srv.drainQueueAndWriteError(ctx, writer, err)
 		}
-		return srv.WriteError(writer, err)
+		return srv.WriteError(ctx, writer, err)
 	}
 
 	if existing != nil {
@@ -397,19 +404,19 @@ func (srv *Session) handleParse(ctx context.Context, reader *buffer.Reader, writ
 	}
 
 	if srv.ParallelPipeline.Enabled {
-		return srv.parsePipelined(ctx, writer, name, query)
+		return srv.parsePipelined(ctx, writer, name, query, parameterOIDs)
 	}
 
-	statement, err := singleStatement(srv.parse(ctx, query))
+	statement, err := singleStatement(srv.parse(ctx, Query{Query: query, ParameterOIDs: parameterOIDs}))
 	if err != nil {
-		return srv.WriteError(writer, err)
+		return srv.WriteError(ctx, writer, err)
 	}
 
 	srv.logger.Debug("incoming extended query", slog.String("query", query), slog.String("name", name), slog.Int("parameters", len(statement.parameters)))
 
 	err = srv.Statements.Set(ctx, name, statement)
 	if err != nil {
-		return srv.WriteError(writer, err)
+		return srv.WriteError(ctx, writer, err)
 	}
 
 	writer.Start(types.ServerParseComplete)
@@ -417,8 +424,8 @@ func (srv *Session) handleParse(ctx context.Context, reader *buffer.Reader, writ
 }
 
 // parsePipelined handles Parse in parallel pipeline mode
-func (srv *Session) parsePipelined(ctx context.Context, writer *buffer.Writer, name, query string) error {
-	statement, err := singleStatement(srv.parse(ctx, query))
+func (srv *Session) parsePipelined(ctx context.Context, writer *buffer.Writer, name, query string, parameterOIDs []uint32) error {
+	statement, err := singleStatement(srv.parse(ctx, Query{Query: query, ParameterOIDs: parameterOIDs}))
 	if err != nil {
 		return srv.drainQueueAndWriteError(ctx, writer, err)
 	}
@@ -455,11 +462,11 @@ func (srv *Session) handleDescribe(ctx context.Context, reader *buffer.Reader, w
 	case types.DescribeStatement:
 		statement, err := srv.Statements.Get(ctx, name)
 		if err != nil {
-			return srv.WriteError(writer, err)
+			return srv.WriteError(ctx, writer, err)
 		}
 
 		if statement == nil {
-			return srv.WriteError(writer, errors.New("unknown statement"))
+			return srv.WriteError(ctx, writer, errors.New("unknown statement"))
 		}
 
 		if err := srv.writeParameterDescription(writer, statement.parameters); err != nil {
@@ -470,17 +477,17 @@ func (srv *Session) handleDescribe(ctx context.Context, reader *buffer.Reader, w
 	case types.DescribePortal:
 		portal, err := srv.Portals.Get(ctx, name)
 		if err != nil {
-			return srv.WriteError(writer, err)
+			return srv.WriteError(ctx, writer, err)
 		}
 
 		if portal == nil {
-			return srv.WriteError(writer, errors.New("unknown portal"))
+			return srv.WriteError(ctx, writer, errors.New("unknown portal"))
 		}
 
 		return srv.writeColumnDescription(ctx, writer, portal.formats, portal.statement.columns)
 	}
 
-	return srv.WriteError(writer, fmt.Errorf("unknown describe command: %s", string(d[0])))
+	return srv.WriteError(ctx, writer, fmt.Errorf("unknown describe command: %s", string(d[0])))
 }
 
 // describePipelined handles Describe in parallel pipeline mode
@@ -568,16 +575,16 @@ func (srv *Session) handleBind(ctx context.Context, reader *buffer.Reader, write
 
 	stmt, err := srv.Statements.Get(ctx, statement)
 	if err != nil {
-		return srv.WriteError(writer, err)
+		return srv.WriteError(ctx, writer, err)
 	}
 
 	if stmt == nil {
-		return srv.WriteError(writer, NewErrUnkownStatement(statement))
+		return srv.WriteError(ctx, writer, NewErrUnkownStatement(statement))
 	}
 
 	err = srv.Portals.Bind(ctx, name, stmt, parameters, formats)
 	if err != nil {
-		return srv.WriteError(writer, err)
+		return srv.WriteError(ctx, writer, err)
 	}
 
 	writer.Start(types.ServerBindComplete)
@@ -699,7 +706,7 @@ func (srv *Session) handleExecute(ctx context.Context, reader *buffer.Reader, wr
 		if srv.ParallelPipeline.Enabled {
 			return srv.drainQueueAndWriteError(ctx, writer, err)
 		}
-		return srv.WriteError(writer, err)
+		return srv.WriteError(ctx, writer, err)
 	}
 
 	name, err := reader.GetString()
@@ -722,7 +729,7 @@ func (srv *Session) handleExecute(ctx context.Context, reader *buffer.Reader, wr
 
 	err = srv.Portals.Execute(ctx, name, Limit(limit), reader, writer)
 	if err != nil {
-		return srv.WriteError(writer, err)
+		return srv.WriteError(ctx, writer, err)
 	}
 
 	return nil
@@ -835,11 +842,26 @@ func (srv *Session) handleSync(ctx context.Context, writer *buffer.Writer) error
 		}
 	}
 
+	// Capture the error state of this extended-query series before clearing it;
+	// the Sync callback needs it to decide between committing and rolling back.
+	failed := srv.discardUntilSync
+
 	// Sync always resets discardUntilSync, even if queue processing set it.
 	srv.discardUntilSync = false
 
-	// Original synchronous behavior - just return ReadyForQuery
-	return readyForQuery(writer, types.ServerIdle)
+	if srv.SyncConn != nil {
+		if err := srv.SyncConn(ctx, failed); err != nil {
+			// A Sync must always be answered by exactly one ReadyForQuery with
+			// no discarding ("no skipping occurs if an error is detected while
+			// processing Sync"). Clearing inExtendedQuery makes WriteError take
+			// the simple-query path: ErrorResponse followed by ReadyForQuery,
+			// instead of setting discardUntilSync and swallowing ReadyForQuery.
+			srv.inExtendedQuery = false
+			return srv.WriteError(ctx, writer, err)
+		}
+	}
+
+	return srv.readyForQuery(ctx, writer)
 }
 
 // processResponseQueue drains the queue and writes all events to the writer.
@@ -855,7 +877,7 @@ func (srv *Session) processResponseQueue(ctx context.Context, writer *buffer.Wri
 	}
 
 	if queueErr != nil {
-		if err := srv.WriteError(writer, queueErr); err != nil {
+		if err := srv.WriteError(ctx, writer, queueErr); err != nil {
 			return err
 		}
 	}
@@ -890,7 +912,7 @@ func (srv *Session) drainQueueOnError(ctx context.Context, writer *buffer.Writer
 	srv.ResponseQueue.Clear()
 
 	if queueErr != nil {
-		return srv.WriteError(writer, queueErr)
+		return srv.WriteError(ctx, writer, queueErr)
 	}
 
 	return nil
@@ -903,7 +925,7 @@ func (srv *Session) drainQueueAndWriteError(ctx context.Context, writer *buffer.
 	if drainErr := srv.drainQueueOnError(ctx, writer); drainErr != nil {
 		return drainErr
 	}
-	return srv.WriteError(writer, err)
+	return srv.WriteError(ctx, writer, err)
 }
 
 func singleStatement(stmts PreparedStatements, err error) (*PreparedStatement, error) {
@@ -955,7 +977,7 @@ func (srv *Session) writeQueuedResponse(ctx context.Context, writer *buffer.Writ
 		}
 
 		if event.Result.err != nil {
-			return srv.WriteError(writer, event.Result.err)
+			return srv.WriteError(ctx, writer, event.Result.err)
 		}
 
 		_, err := writer.Write(event.Result.buf.Bytes())

@@ -13,6 +13,7 @@ jobs:
       - uses: actions/checkout@v3
 
       - name: Set up Go
+        id: go
         uses: actions/setup-go@v4
         with:
           go-version: "stable"
@@ -21,7 +22,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ./bin
-          key: ${{ runner.os }}-bin-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-${{ steps.go.outputs.go-version }}-bin-${{ hashFiles('**/go.sum', 'Makefile') }}
 
       - name: Run linter
         run: make lint
@@ -30,7 +31,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ./bin
-          key: ${{ runner.os }}-bin-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-${{ steps.go.outputs.go-version }}-bin-${{ hashFiles('**/go.sum', 'Makefile') }}
 
   test:
     runs-on: ubuntu-latest
@@ -38,6 +39,7 @@ jobs:
       - uses: actions/checkout@v3
 
       - name: Set up Go
+        id: go
         uses: actions/setup-go@v4
         with:
           go-version: "stable"
@@ -46,7 +48,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ./bin
-          key: ${{ runner.os }}-bin-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-${{ steps.go.outputs.go-version }}-bin-${{ hashFiles('**/go.sum', 'Makefile') }}
 
       - name: Run tests
         run: make test
@@ -55,4 +57,4 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ./bin
-          key: ${{ runner.os }}-bin-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-${{ steps.go.outputs.go-version }}-bin-${{ hashFiles('**/go.sum', 'Makefile') }}

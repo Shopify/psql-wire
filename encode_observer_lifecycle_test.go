@@ -37,7 +37,7 @@ func TestEncodeObserverLegacyLimitPublishesEncodedRows(t *testing.T) {
 		} {
 			t.Run(fmt.Sprintf("parallel=%t/%s", parallel, tc.name), func(t *testing.T) {
 				rec := &recordingObserver{}
-				conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
+				conn := compatibilityClient(t, func(context.Context, Query) (PreparedStatements, error) {
 					return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) error {
 						for i := 0; i < 2; i++ {
 							if err := w.Row([]any{"row"}); err != nil {
@@ -70,7 +70,7 @@ func TestEncodeObserverHandlerErrorPublishesEncodedValues(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			rec := &recordingObserver{}
 			handlerErr := errors.New("backend failed")
-			conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
+			conn := compatibilityClient(t, func(context.Context, Query) (PreparedStatements, error) {
 				return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) error {
 					for i := 0; i < 2; i++ {
 						if err := w.Row([]any{"row"}); err != nil {
@@ -102,7 +102,7 @@ func TestEncodeObserverSuspendedPortalTeardownDoesNotRepublish(t *testing.T) {
 		t.Run(fmt.Sprint(parallel), func(t *testing.T) {
 			rec := &recordingObserver{}
 			returned := make(chan error, 1)
-			conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
+			conn := compatibilityClient(t, func(context.Context, Query) (PreparedStatements, error) {
 				return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) (err error) {
 					defer func() { returned <- err }()
 					for i := 0; i < 3; i++ {
@@ -161,7 +161,7 @@ func TestEncodeObserverFormatsFollowNegotiatedColumns(t *testing.T) {
 		} {
 			t.Run(fmt.Sprintf("parallel=%t/formats=%v", parallel, tc.formats), func(t *testing.T) {
 				rec := &recordingObserver{}
-				conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
+				conn := compatibilityClient(t, func(context.Context, Query) (PreparedStatements, error) {
 					return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) error {
 						if err := w.Row([]any{"x", int32(7)}); err != nil {
 							return err

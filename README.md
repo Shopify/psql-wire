@@ -28,9 +28,9 @@ func main() {
 	wire.ListenAndServe("127.0.0.1:5432", handler)
 }
 
-func handler(ctx context.Context, query string) (wire.PreparedStatements, error) {
+func handler(ctx context.Context, query wire.Query) (wire.PreparedStatements, error) {
 	return wire.Prepared(wire.NewStatement(func(ctx context.Context, writer wire.DataWriter, parameters []wire.Parameter) error {
-		fmt.Println(query)
+		fmt.Println(query.Query)
 		return writer.Complete("OK")
 	})), nil
 }
@@ -49,6 +49,17 @@ wire.SetAttribute(ctx, "tenant_id", "tenant-123")
 // Get a session attribute
 tenantID, ok := wire.GetAttribute(ctx, "tenant_id")
 ```
+
+## Writing materialized rows
+
+Use `wire.WriteRows(writer, rows)` to write a `[][]any` result in order. It uses
+the optional `RowWriter` interface when available and otherwise calls `Row` for
+each row, so existing `DataWriter` implementations remain compatible.
+
+For unlimited Execute requests, the built-in writer groups complete DataRow
+frames into chunks with a 32 KiB flush threshold. Limited portals continue to
+write and yield per row, preserving portal suspension. Streaming handlers can
+continue calling `Row` as values become available.
 
 ---
 
@@ -79,5 +90,4 @@ Feel free to checkout the [open TODO's](https://github.com/jeroenrinzema/psql-wi
 Everyone is welcome to contribute, whether it's in the form of code, documentation, bug reports, feature requests, or anything else. We encourage you to experiment with the project and make contributions to help evolve it to meet your needs!
 
 See the [contributing guide](https://github.com/jeroenrinzema/psql-wire/blob/main/CONTRIBUTING.md) for more details.
-
 
