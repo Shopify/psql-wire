@@ -38,7 +38,16 @@ func (srv *Server) Handshake(conn net.Conn) (_ net.Conn, version types.Version, 
 			return conn, version, reader, err
 		}
 
-		return srv.Handshake(conn)
+		// A client can make at most one GSS encryption negotiation attempt per
+		// connection. Read the next startup packet with the existing reader so
+		// bytes already buffered after the GSS request are not discarded.
+		version, err = srv.readVersion(reader)
+		if err != nil {
+			return conn, version, reader, err
+		}
+		if version == types.VersionGSSENC {
+			return conn, version, reader, errors.New("repeated GSS encryption request")
+		}
 	}
 
 	conn, reader, version, err = srv.potentialConnUpgrade(conn, reader, version)
