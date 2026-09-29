@@ -262,6 +262,10 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 			}
 		}
 
+		if err := writer.Flush(); err != nil {
+			return err
+		}
+
 		if srv.FlushConn != nil {
 			return srv.FlushConn(ctx)
 		}

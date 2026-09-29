@@ -128,7 +128,9 @@ func (srv *Session) readyForQuery(ctx context.Context, writer *buffer.Writer) er
 	if err := writer.End(); err != nil {
 		return err
 	}
-	return nil
+	// A pipelining client may already have sent its next query, in which case
+	// the server starts it without blocking on a read, and so without flushing.
+	return writer.Flush()
 }
 
 // txStatus returns the byte that should be written into the next ReadyForQuery
