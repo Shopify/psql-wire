@@ -21,7 +21,7 @@ import (
 )
 
 func TestErrorCode(t *testing.T) {
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+	handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
 		stmt := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
 			return psqlerr.WithSeverity(psqlerr.WithCode(errors.New("unimplemented feature"), codes.FeatureNotSupported), psqlerr.LevelFatal)
 		})
@@ -70,8 +70,8 @@ func TestErrorCode(t *testing.T) {
 func TestExtendedQueryParseErrorRecovery(t *testing.T) {
 	t.Parallel()
 
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
-		if query == "SELECT error" {
+	handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
+		if query.Query == "SELECT error" {
 			return nil, psqlerr.WithCode(errors.New("test error"), codes.Syntax)
 		}
 
@@ -119,10 +119,10 @@ func TestExtendedQueryParseErrorRecovery(t *testing.T) {
 func TestExtendedQueryExecuteErrorRecovery(t *testing.T) {
 	t.Parallel()
 
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+	handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
 		columns := Columns{{Name: "result", Oid: 25}} // text
 
-		if query == "SELECT error" {
+		if query.Query == "SELECT error" {
 			stmt := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
 				return psqlerr.WithCode(errors.New("execution failed"), codes.DataException)
 			}, WithColumns(columns))
@@ -174,7 +174,7 @@ func TestSessionErrorCode(t *testing.T) {
 			Portals:    &DefaultPortalCache{},
 		}
 
-		err := session.WriteError(writer, psqlerr.WithCode(errors.New("some error"), codes.Syntax))
+		err := session.WriteError(context.Background(), writer, psqlerr.WithCode(errors.New("some error"), codes.Syntax))
 		assert.NoError(t, err)
 
 		reader := buffer.NewReader(logger, sink, buffer.DefaultBufferSize)
@@ -200,7 +200,7 @@ func TestSessionErrorCode(t *testing.T) {
 			inExtendedQuery: true,
 		}
 
-		err := session.WriteError(writer, psqlerr.WithCode(errors.New("some error"), codes.Syntax))
+		err := session.WriteError(context.Background(), writer, psqlerr.WithCode(errors.New("some error"), codes.Syntax))
 		assert.NoError(t, err)
 		assert.True(t, session.discardUntilSync)
 
@@ -227,7 +227,7 @@ func TestSessionErrorCode(t *testing.T) {
 		}
 
 		inputErr := psqlerr.WithSeverity(psqlerr.WithCode(errors.New("invalid username/password"), codes.InvalidPassword), psqlerr.LevelFatal)
-		err := session.WriteError(writer, inputErr)
+		err := session.WriteError(context.Background(), writer, inputErr)
 		assert.ErrorIs(t, err, inputErr)
 
 		reader := buffer.NewReader(logger, sink, buffer.DefaultBufferSize)
@@ -253,7 +253,7 @@ func TestSessionErrorCode(t *testing.T) {
 		}
 
 		inputErr := psqlerr.WithSeverity(psqlerr.WithCode(errors.New("fatal failure"), codes.FeatureNotSupported), psqlerr.LevelFatal)
-		err := session.WriteError(writer, inputErr)
+		err := session.WriteError(context.Background(), writer, inputErr)
 		assert.ErrorIs(t, err, inputErr)
 		assert.False(t, session.discardUntilSync)
 
@@ -266,6 +266,32 @@ func TestSessionErrorCode(t *testing.T) {
 		_, _, err = reader.ReadTypedMsg()
 		assert.Error(t, err)
 	})
+
+	t.Run("passes ctx to TxStatus when sending ReadyForQuery", func(t *testing.T) {
+		logger := slogt.New(t)
+		sink := bytes.NewBuffer([]byte{})
+		writer := buffer.NewWriter(logger, sink)
+
+		type ctxKey struct{}
+		var seen context.Context
+		session := &Session{
+			Server: &Server{
+				logger: logger,
+				TxStatus: func(ctx context.Context) types.ServerStatus {
+					seen = ctx
+					return types.ServerIdle
+				},
+			},
+			Statements: &DefaultStatementCache{},
+			Portals:    &DefaultPortalCache{},
+		}
+
+		ctx := context.WithValue(context.Background(), ctxKey{}, "marker")
+		err := session.WriteError(ctx, writer, psqlerr.WithCode(errors.New("boom"), codes.Syntax))
+		require.NoError(t, err)
+		require.NotNil(t, seen, "TxStatus callback was not invoked")
+		assert.Equal(t, "marker", seen.Value(ctxKey{}), "TxStatus received a different ctx than the one passed to WriteError")
+	})
 }
 
 func TestDiscardUntilSync(t *testing.T) {
@@ -276,7 +302,7 @@ func TestDiscardUntilSync(t *testing.T) {
 	ctx = setTypeInfo(ctx, typeMap)
 	logger := slogt.New(t)
 
-	mockParse := func(ctx context.Context, query string) (PreparedStatements, error) {
+	mockParse := func(ctx context.Context, query Query) (PreparedStatements, error) {
 		stmt := NewStatement(
 			func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
 				return errors.New("query failed")
@@ -367,7 +393,7 @@ func TestRowReturnsEncodeError(t *testing.T) {
 
 	var rowErr error
 
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+	handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
 		columns := Columns{{Name: "val", Oid: pgtype.Int4OID}}
 
 		stmt := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {

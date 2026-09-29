@@ -13,7 +13,7 @@ func TestFormatsMatchNegotiatedWireOutput(t *testing.T) {
 		for _, formats := range [][]int16{nil, {1}, {0, 1}} {
 			t.Run(fmt.Sprintf("parallel=%t/formats=%v", parallel, formats), func(t *testing.T) {
 				captured := make(chan []FormatCode, 1)
-				conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
+				conn := compatibilityClient(t, func(context.Context, Query) (PreparedStatements, error) {
 					return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) error {
 						captured <- append([]FormatCode(nil), w.Formats()...)
 						if err := w.Row([]any{"x", int32(7)}); err != nil {

@@ -10,11 +10,41 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
+	"github.com/jeroenrinzema/psql-wire/pkg/types"
 )
+
+// TxStatusFn returns the PostgreSQL transaction status byte ('I', 'T', or 'E')
+// of the current session. It is invoked by the server just before sending a
+// ReadyForQuery message so the client (and any connection pooler in between)
+// sees the actual session state. The ctx carries any per-session values set up
+// via [SessionMiddleware], so implementations can look up their own session
+// state from it.
+type TxStatusFn func(ctx context.Context) types.ServerStatus
+
+// Query represents an incoming query which should be parsed into one or more
+// prepared statements. Besides the raw query string it carries metadata about
+// how the query was received by the server.
+type Query struct {
+	// Query holds the raw SQL query string as received from the client.
+	Query string
+
+	// ParameterOIDs holds the parameter type OIDs that the client specified in
+	// the Parse message. A zero OID means the client left that parameter's type
+	// unspecified. The amount of provided parameter OIDs may be less than the
+	// number of parameters that appear in the query string, indicating that the
+	// server can decide the types for the unspecified parameters. This slice is
+	// always empty for simple queries since the simple query protocol does not
+	// allow the client to specify parameter types.
+	ParameterOIDs []uint32
+
+	// SimpleQuery is true when the query was received through the simple query
+	// protocol instead of the extended query (Parse/Bind/Execute) protocol.
+	SimpleQuery bool
+}
 
 // ParseFn parses the given query and returns a prepared statement which could
 // be used to execute at a later point in time.
-type ParseFn func(ctx context.Context, query string) (PreparedStatements, error)
+type ParseFn func(ctx context.Context, query Query) (PreparedStatements, error)
 
 // PreparedStatementFn represents a query of which a statement has been
 // prepared. The statement could be executed at any point in time with the given
@@ -128,6 +158,16 @@ type FlushFn func(ctx context.Context) error
 
 type CloseFn func(ctx context.Context) error
 
+// SyncFn is called when the frontend sends a Sync message, which marks the end
+// of a series of extended-query messages. Per the PostgreSQL protocol a Sync
+// closes the implicit transaction opened by that series: the callback should
+// commit when the series completed without error and roll back when it didn't.
+// The failed argument reports which of the two happened; it is true when an
+// error was raised while processing any of the extended-query messages that
+// this Sync terminates. The callback runs before the ReadyForQuery is sent, so
+// any transaction state it updates is reflected by a configured [TxStatusFn].
+type SyncFn func(ctx context.Context, failed bool) error
+
 // CancelRequestFn function called when a cancel request is received.
 // The function receives the process ID and secret key from the cancel request.
 // It should return an error if the cancel request cannot be processed.
@@ -186,6 +226,20 @@ func FlushConn(fn FlushFn) OptionFn {
 	}
 }
 
+// SyncConn registers a handler for Sync messages.
+//
+// The provided handler is invoked when the frontend sends a Sync command,
+// which closes the current series of extended-query messages. It is the place
+// to commit or roll back the implicit transaction that spans that series; see
+// [SyncFn] for the commit-vs-rollback semantics conveyed by its failed
+// argument. The handler runs just before the server sends ReadyForQuery.
+func SyncConn(fn SyncFn) OptionFn {
+	return func(srv *Server) error {
+		srv.SyncConn = fn
+		return nil
+	}
+}
+
 // ParallelPipeline sets the parallel pipeline configuration for the server.
 // This controls whether Execute events can run concurrently within a session.
 func ParallelPipeline(config ParallelPipelineConfig) OptionFn {
@@ -203,6 +257,18 @@ func ParallelPipeline(config ParallelPipelineConfig) OptionFn {
 func PortalSuspension(enabled bool) OptionFn {
 	return func(srv *Server) error {
 		srv.disablePortalSuspension = !enabled
+		return nil
+	}
+}
+
+// TxStatus registers a callback that returns the PostgreSQL transaction status
+// byte of the current session. When configured, the server calls it before
+// every ReadyForQuery and uses the returned status ('I', 'T', or 'E') instead
+// of the default [types.ServerIdle]. Without this option ReadyForQuery always
+// reports idle, which confuses transaction-aware connection poolers.
+func TxStatus(fn TxStatusFn) OptionFn {
+	return func(srv *Server) error {
+		srv.TxStatus = fn
 		return nil
 	}
 }
