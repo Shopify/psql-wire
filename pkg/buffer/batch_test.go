@@ -127,3 +127,44 @@ func TestBatchOversizedFrameReleasesStorage(t *testing.T) {
 		require.Zero(t, writer.batch.Cap())
 	}()
 }
+
+func TestSessionBuffering(t *testing.T) {
+	out := &batchOutput{}
+	writer := NewWriter(slogt.New(t), out)
+	write := func() {
+		writer.Start(types.ServerDataRow)
+		writer.AddInt16(0)
+		require.NoError(t, writer.End())
+	}
+	writer.StartSessionBuffering(14)
+	write()
+	require.NoError(t, writer.Flush())
+	require.Len(t, out.packets, 1)
+	require.NoError(t, writer.Flush())
+	require.Len(t, out.packets, 1, "empty Flush does not write")
+
+	// Row batches nest inside session buffering without flushing or changing
+	// the threshold.
+	writer.StartBatch(1 << 20)
+	write()
+	require.NoError(t, writer.EndBatch())
+	require.Empty(t, out.packets[1:])
+	require.Equal(t, 7, writer.Buffered())
+	write()
+	require.Len(t, out.packets, 2, "the threshold still flushes")
+	require.Len(t, out.packets[1], 14)
+
+	// Small pre-framed payloads join the buffer; large ones are written
+	// directly after the pending frames.
+	write()
+	_, err := writer.WriteFrames([]byte{'C', 0, 0, 0, 4})
+	require.NoError(t, err)
+	require.Len(t, out.packets, 2)
+	large := bytes.Repeat([]byte{'x'}, 14)
+	_, err = writer.WriteFrames(large)
+	require.NoError(t, err)
+	require.Len(t, out.packets, 4)
+	require.Len(t, out.packets[2], 12)
+	require.Equal(t, large, out.packets[3])
+	require.Zero(t, writer.Buffered())
+}

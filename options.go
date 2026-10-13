@@ -294,6 +294,15 @@ func MessageBufferSize(size int) OptionFn {
 	}
 }
 
+// WithResponseBuffering sets [Server.ResponseBufferBytes]. A negative threshold
+// counts as zero (one write per message). PostgreSQL uses 8 KiB.
+func WithResponseBuffering(threshold int) OptionFn {
+	return func(srv *Server) error {
+		srv.ResponseBufferBytes = max(threshold, 0)
+		return nil
+	}
+}
+
 // ClientAuth sets the client authentication type which is used to authenticate
 // the client connection. The default value is [tls.NoClientCert] which means
 // that no client authentication is performed.

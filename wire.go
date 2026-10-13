@@ -148,6 +148,15 @@ type Server struct {
 	ShutdownTimeout  time.Duration
 	typeExtension    func(*pgtype.Map)
 	encodeObserver   EncodeObserver
+	// ResponseBufferBytes is the per-session send buffer threshold. Zero (the
+	// default) writes each protocol message separately. A positive value
+	// buffers response frames, as the PostgreSQL backend does, and writes them
+	// at ReadyForQuery, on a client Flush, after an ErrorResponse or
+	// CopyInResponse, or once this many bytes are buffered. Startup and
+	// authentication are not buffered. Rows from a slow handler then reach the
+	// client only at one of those points; handlers that expect clients to see
+	// rows before Complete need zero. PostgreSQL makes no stronger promise.
+	ResponseBufferBytes int
 	// Compatibility for embedders whose execution leases cannot be suspended.
 	disablePortalSuspension bool
 	closer                  chan struct{}

@@ -98,6 +98,13 @@ func (srv *Session) consumeCommands(ctx context.Context, conn net.Conn, reader *
 	srv.reader = reader
 	srv.logger.Debug("ready for query... starting to consume commands")
 
+	// Startup and authentication stay unbuffered: the client waits on each of
+	// those messages before it sends the next one.
+	if srv.ResponseBufferBytes > 0 {
+		writer.StartSessionBuffering(srv.ResponseBufferBytes)
+		defer func() { _ = writer.Flush() }()
+	}
+
 	// The very first ReadyForQuery is sent before any statement has run, so
 	// the session is always idle here. We still go through readyForQuery so a
 	// configured TxStatus callback gets a consistent signal that
@@ -260,6 +267,12 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 			if err := srv.processResponseQueue(ctx, writer); err != nil {
 				return err
 			}
+		}
+
+		// Deliver buffered responses before the hook, so a hook that flushes
+		// its own connection wrapper sees them.
+		if err := writer.Flush(); err != nil {
+			return err
 		}
 
 		if srv.FlushConn != nil {
@@ -980,7 +993,7 @@ func (srv *Session) writeQueuedResponse(ctx context.Context, writer *buffer.Writ
 			return srv.WriteError(ctx, writer, event.Result.err)
 		}
 
-		_, err := writer.Write(event.Result.buf.Bytes())
+		_, err := writer.WriteFrames(event.Result.buf.Bytes())
 		return err
 
 	default:

@@ -16,6 +16,7 @@ type Writer struct {
 	frame          bytes.Buffer
 	batch          bytes.Buffer
 	batching       bool
+	session        bool // session-scoped buffering: EndBatch keeps buffering; Flush sends
 	batchLimit     int
 	putbuf         [64]byte // buffer used to construct messages which could be written to the writer frame buffer
 	err            error
@@ -132,11 +133,59 @@ func (writer *Writer) Reset() {
 // Callers must defer EndBatch immediately, including on error paths, so later
 // protocol messages cannot be left in an unflushed batch.
 func (writer *Writer) StartBatch(threshold int) {
+	if writer.session {
+		// Session buffering already coalesces every frame until Flush; a
+		// nested row batch has nothing to add and must not change the limit.
+		return
+	}
 	if threshold <= 0 {
 		threshold = 32 << 10
 	}
 	writer.batchLimit = threshold
 	writer.batching = true
+}
+
+// StartSessionBuffering buffers complete frames until Flush is called or
+// threshold bytes accumulate, like the PostgreSQL backend's send buffer. A
+// non-positive threshold selects 8 KiB. It stays on for the writer's lifetime;
+// StartBatch and EndBatch become no-ops, so callers must Flush at protocol
+// points where the client waits for output.
+func (writer *Writer) StartSessionBuffering(threshold int) {
+	if threshold <= 0 {
+		threshold = 8 << 10
+	}
+	writer.batchLimit = threshold
+	writer.batching = true
+	writer.session = true
+}
+
+// Flush sends every buffered frame to the underlying writer and keeps the
+// current buffering mode. It is a no-op when nothing is buffered.
+func (writer *Writer) Flush() error {
+	return writer.flushBatch()
+}
+
+// WriteFrames appends already-framed protocol bytes (for example a pre-rendered
+// Execute result) to the current batch, or writes them through when batching is
+// off. A payload at or above the batch limit is written directly after the
+// pending batch is flushed, so large results are not copied a second time.
+func (writer *Writer) WriteFrames(frames []byte) (int, error) {
+	if !writer.batching {
+		return writer.Write(frames)
+	}
+	if len(frames) >= writer.batchLimit {
+		if err := writer.flushBatch(); err != nil {
+			return 0, err
+		}
+		return writer.Write(frames)
+	}
+	n, _ := writer.batch.Write(frames)
+	if writer.batch.Len() >= writer.batchLimit {
+		if err := writer.flushBatch(); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // Buffered returns the number of complete frame bytes awaiting a batch flush.
@@ -147,6 +196,9 @@ func (writer *Writer) Buffered() int {
 // EndBatch flushes pending complete frames and disables batching, even if the
 // flush fails. An incomplete active frame is never included in the batch.
 func (writer *Writer) EndBatch() error {
+	if writer.session {
+		return nil
+	}
 	writer.batching = false
 	return writer.flushBatch()
 }

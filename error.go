@@ -85,6 +85,11 @@ func (srv *Session) WriteError(ctx context.Context, writer *buffer.Writer, err e
 	if werr := WriteUnterminatedError(writer, err); werr != nil {
 		return werr
 	}
+	// PostgreSQL flushes right after an ErrorResponse (elog.c) so the client
+	// learns about the failure even if the backend never reaches ReadyForQuery.
+	if werr := writer.Flush(); werr != nil {
+		return werr
+	}
 
 	desc := psqlerr.Flatten(err)
 
