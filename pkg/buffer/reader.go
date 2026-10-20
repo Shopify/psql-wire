@@ -88,7 +88,9 @@ func (reader *Reader) ReadTypedMsg() (types.ClientMessage, int, error) {
 
 	n, err := reader.ReadUntypedMsg()
 	if err != nil {
-		return 0, 0, err
+		// Keep the type: callers that recover from ErrMessageSizeExceeded need
+		// it to keep extended-query state (and discard-until-Sync) correct.
+		return typed, 0, err
 	}
 
 	return typed, n, nil

@@ -126,7 +126,7 @@ func (srv *Session) consumeSingleCommand(ctx context.Context, reader *buffer.Rea
 
 	// NOTE: we could recover from this scenario
 	if errors.Is(err, buffer.ErrMessageSizeExceeded) {
-		err = srv.handleMessageSizeExceeded(ctx, reader, writer, err)
+		err = srv.handleMessageSizeExceeded(ctx, t, reader, writer, err)
 		if err != nil {
 			return err
 		}
@@ -160,13 +160,15 @@ func (srv *Session) consumeSingleCommand(ctx context.Context, reader *buffer.Rea
 // handleMessageSizeExceeded attempts to unwrap the given error message as
 // message size exceeded. The expected message size will be consumed and
 // discarded from the given reader. An error message is written to the client
-// once the expected message size is read.
+// once the expected message size is read, unless the message belongs to an
+// extended-query series that already failed. PostgreSQL discards such a
+// message until Sync and sends no second error.
 //
 // The given error is returned if it does not contain an message size exceeded
 // type. A fatal error is returned when an unexpected error is returned while
 // consuming the expected message size or when attempting to write the error
 // message back to the client.
-func (srv *Session) handleMessageSizeExceeded(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer, exceeded error) (err error) {
+func (srv *Session) handleMessageSizeExceeded(ctx context.Context, t types.ClientMessage, reader *buffer.Reader, writer *buffer.Writer, exceeded error) (err error) {
 	unwrapped, has := buffer.UnwrapMessageSizeExceeded(exceeded)
 	if !has {
 		return exceeded
@@ -175,6 +177,26 @@ func (srv *Session) handleMessageSizeExceeded(ctx context.Context, reader *buffe
 	err = reader.Slurp(unwrapped.Size)
 	if err != nil {
 		return err
+	}
+
+	if srv.inExtendedQuery && t != types.ClientSync {
+		// An earlier error in this extended-query series already produced the
+		// one ErrorResponse; PostgreSQL discards every message until Sync.
+		if srv.discardUntilSync {
+			srv.logger.Debug("discarding oversized message until sync", slog.String("type", t.String()))
+			return nil
+		}
+
+		// Queued pipeline results precede this message; write them first so
+		// the ErrorResponse lands in this message's position.
+		if srv.ParallelPipeline.Enabled {
+			if err := srv.drainQueueOnError(ctx, writer); err != nil {
+				return err
+			}
+			if srv.discardUntilSync {
+				return nil
+			}
+		}
 	}
 
 	return srv.WriteError(ctx, writer, exceeded)
