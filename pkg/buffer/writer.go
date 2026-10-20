@@ -14,6 +14,9 @@ type Writer struct {
 	io.Writer
 	logger         *slog.Logger
 	frame          bytes.Buffer
+	batch          bytes.Buffer
+	batching       bool
+	batchLimit     int
 	putbuf         [64]byte // buffer used to construct messages which could be written to the writer frame buffer
 	err            error
 	ErrorSanitizer func(error) error
@@ -123,6 +126,50 @@ func (writer *Writer) Reset() {
 	writer.err = nil
 }
 
+// StartBatch buffers complete frames until threshold bytes have accumulated.
+// A non-positive threshold selects 32 KiB. Frames are never split, so a chunk
+// can exceed the threshold by the size of its last frame. Batches cannot nest.
+// Callers must defer EndBatch immediately, including on error paths, so later
+// protocol messages cannot be left in an unflushed batch.
+func (writer *Writer) StartBatch(threshold int) {
+	if threshold <= 0 {
+		threshold = 32 << 10
+	}
+	writer.batchLimit = threshold
+	writer.batching = true
+}
+
+// Buffered returns the number of complete frame bytes awaiting a batch flush.
+func (writer *Writer) Buffered() int {
+	return writer.batch.Len()
+}
+
+// EndBatch flushes pending complete frames and disables batching, even if the
+// flush fails. An incomplete active frame is never included in the batch.
+func (writer *Writer) EndBatch() error {
+	writer.batching = false
+	return writer.flushBatch()
+}
+
+func (writer *Writer) flushBatch() error {
+	if writer.batch.Len() == 0 {
+		return nil
+	}
+	defer func() {
+		// Do not retain an oversized row in both the frame and batch buffers.
+		if writer.batch.Cap() > 2*writer.batchLimit {
+			writer.batch = bytes.Buffer{}
+		} else {
+			writer.batch.Reset()
+		}
+	}()
+	n, err := writer.Write(writer.batch.Bytes())
+	if err == nil && n != writer.batch.Len() {
+		err = io.ErrShortWrite
+	}
+	return err
+}
+
 // End writes the prepared message to the given writer and resets the buffer.
 // The to be expected message length is appended after the message status byte.
 func (writer *Writer) End() error {
@@ -134,7 +181,15 @@ func (writer *Writer) End() error {
 	bytes := writer.frame.Bytes()
 	length := uint32(writer.frame.Len() - 1) // total message length minus the message type byte
 	binary.BigEndian.PutUint32(bytes[1:5], length)
-	_, err := writer.Write(bytes)
+	var err error
+	if writer.batching {
+		_, _ = writer.batch.Write(bytes)
+		if writer.batch.Len() >= writer.batchLimit {
+			err = writer.flushBatch()
+		}
+	} else {
+		_, err = writer.Write(bytes)
+	}
 
 	writer.logger.Debug("-> writing message", slog.String("type", types.ServerMessage(bytes[0]).String()))
 	return err

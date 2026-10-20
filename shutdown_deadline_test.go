@@ -10,7 +10,7 @@ import (
 )
 
 func TestRepeatedShutdownHonorsEachCallersDeadline(t *testing.T) {
-	server, err := NewServer(func(context.Context, string) (PreparedStatements, error) { return nil, nil }, Logger(slogt.New(t)))
+	server, err := NewServer(func(context.Context, Query) (PreparedStatements, error) { return nil, nil }, Logger(slogt.New(t)))
 	require.NoError(t, err)
 	// An active command whose handler ignores cancellation must not make a
 	// second caller wait forever after the first caller's budget expires.
