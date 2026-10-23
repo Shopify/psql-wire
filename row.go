@@ -64,7 +64,11 @@ func (columns Columns) CopyIn(ctx context.Context, writer *buffer.Writer, format
 		writer.AddInt16(int16(format))
 	}
 
-	return writer.End()
+	if err := writer.End(); err != nil {
+		return err
+	}
+	// The client sends CopyData only after it has seen CopyInResponse.
+	return writer.Flush()
 }
 
 // Write writes the given column values back to the client. The given columns

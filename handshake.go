@@ -137,7 +137,9 @@ func (srv *Session) readyForQuery(ctx context.Context, writer *buffer.Writer) er
 	if err := writer.End(); err != nil {
 		return err
 	}
-	return nil
+	// End of cycle: deliver everything buffered since the previous
+	// ReadyForQuery in one write, as the PostgreSQL backend does.
+	return writer.Flush()
 }
 
 // txStatus returns the byte that should be written into the next ReadyForQuery
