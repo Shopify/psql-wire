@@ -29,6 +29,32 @@ type Reader struct {
 	Msg            []byte
 	MaxMessageSize int
 	header         [4]byte
+	source         *hookedReader
+}
+
+// hookedReader calls beforeRead before each read. bufio.Reader reads from it
+// only once its buffer is empty, that is, when the caller would block on the
+// peer.
+type hookedReader struct {
+	io.Reader
+	beforeRead func() error
+}
+
+func (r *hookedReader) Read(p []byte) (int, error) {
+	if r.beforeRead != nil {
+		if err := r.beforeRead(); err != nil {
+			return 0, err
+		}
+	}
+	return r.Reader.Read(p)
+}
+
+// BeforeRead registers fn to run whenever the reader has to read from the
+// underlying reader.
+func (reader *Reader) BeforeRead(fn func() error) {
+	if reader.source != nil {
+		reader.source.beforeRead = fn
+	}
 }
 
 // NewReader constructs a new Postgres wire buffer for the given io.Reader
@@ -41,10 +67,12 @@ func NewReader(logger *slog.Logger, reader io.Reader, bufferSize int) *Reader {
 		bufferSize = DefaultBufferSize
 	}
 
+	source := &hookedReader{Reader: reader}
 	return &Reader{
 		logger:         logger,
-		Buffer:         bufio.NewReaderSize(reader, bufferSize),
+		Buffer:         bufio.NewReaderSize(source, bufferSize),
 		MaxMessageSize: bufferSize,
+		source:         source,
 	}
 }
 

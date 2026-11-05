@@ -240,6 +240,31 @@ func SyncConn(fn SyncFn) OptionFn {
 	}
 }
 
+const defaultWriteBufferMaxDelay = time.Millisecond
+
+// WriteBufferSize coalesces server messages into fewer writes. Complete
+// messages are buffered per connection and written once n bytes are pending,
+// after ReadyForQuery, on a client Flush, before the server reads from the
+// client, when the connection ends, or after WriteBufferMaxDelay. 8192 matches
+// the send buffer of the PostgreSQL backend. With n <= 0, the default, each
+// message is written immediately.
+func WriteBufferSize(n int) OptionFn {
+	return func(srv *Server) error {
+		srv.WriteBufferSize = n
+		return nil
+	}
+}
+
+// WriteBufferMaxDelay limits how long buffered output waits for more messages,
+// so rows written by a handler that then stalls still reach the client. It
+// defaults to 1ms; a negative delay removes the limit.
+func WriteBufferMaxDelay(d time.Duration) OptionFn {
+	return func(srv *Server) error {
+		srv.WriteBufferMaxDelay = d
+		return nil
+	}
+}
+
 // ParallelPipeline sets the parallel pipeline configuration for the server.
 // This controls whether Execute events can run concurrently within a session.
 func ParallelPipeline(config ParallelPipelineConfig) OptionFn {

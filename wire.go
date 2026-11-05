@@ -151,6 +151,10 @@ type Server struct {
 	// Compatibility for embedders whose execution leases cannot be suspended.
 	disablePortalSuspension bool
 	closer                  chan struct{}
+
+	// See WriteBufferSize and WriteBufferMaxDelay.
+	WriteBufferSize     int
+	WriteBufferMaxDelay time.Duration
 }
 
 // ListenAndServe opens a new Postgres server on the preconfigured address and
@@ -254,6 +258,18 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 
 	writer := buffer.NewWriter(srv.logger, conn)
 	writer.ErrorSanitizer = srv.ErrorSanitizer
+	if srv.WriteBufferSize > 0 {
+		writer.SetFlushThreshold(srv.WriteBufferSize)
+		delay := srv.WriteBufferMaxDelay
+		if delay == 0 {
+			delay = defaultWriteBufferMaxDelay
+		}
+		writer.SetFlushDelay(delay)
+		// Flush before blocking on client input, and flush final messages, such
+		// as a fatal error, before the connection is closed.
+		reader.BeforeRead(writer.Flush)
+		defer writer.Flush() //nolint:errcheck
+	}
 
 	// A differing major protocol version cannot be negotiated down, so reject
 	// it before consuming the rest of the startup packet. Only the minor
