@@ -80,6 +80,10 @@ func setTLSConnectionState(ctx context.Context, state *tls.ConnectionState) cont
 // upgraded to TLS. It returns nil for plaintext connections. The state is
 // available to the authentication strategy, the session middleware and the
 // query handlers.
+//
+// PeerCertificates holds whatever the client presented; only VerifiedChains is
+// verified, and only when the [TLSConfig] ClientAuth verifies certificates or
+// the caller verifies them in VerifyConnection.
 func TLSConnectionState(ctx context.Context) *tls.ConnectionState {
 	val := ctx.Value(ctxTLSConnectionState)
 	if val == nil {

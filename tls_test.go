@@ -14,7 +14,6 @@ import (
 	"io"
 	"math/big"
 	"net"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -157,29 +156,28 @@ func assertClosedWithoutAuth(t *testing.T, conn net.Conn) {
 		t.Fatal("server did not close the connection")
 	}
 
-	authOK := []byte{byte(types.ServerAuth), 0, 0, 0, 8, 0, 0, 0, 0}
-	assert.NotContains(t, string(received), string(authOK), "server authenticated the connection")
+	authOKMsg := []byte{byte(types.ServerAuth), 0, 0, 0, 8, 0, 0, 0, 0}
+	assert.NotContains(t, string(received), string(authOKMsg), "server authenticated the connection")
 }
 
 func TestTLSCertificateReload(t *testing.T) {
 	t.Parallel()
 
-	cert, _ := generateTestCertWithUsage(t, "server", x509.ExtKeyUsageServerAuth)
+	first, firstLeaf := generateTestCertWithUsage(t, "first", x509.ExtKeyUsageServerAuth)
+	second, secondLeaf := generateTestCertWithUsage(t, "second", x509.ExtKeyUsageServerAuth)
 
-	configs := map[string]func(calls *atomic.Int32) *tls.Config{
-		"GetCertificate": func(calls *atomic.Int32) *tls.Config {
+	configs := map[string]func(current *atomic.Pointer[tls.Certificate]) *tls.Config{
+		"GetCertificate": func(current *atomic.Pointer[tls.Certificate]) *tls.Config {
 			return &tls.Config{
 				GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-					calls.Add(1)
-					return &cert, nil
+					return current.Load(), nil
 				},
 			}
 		},
-		"GetConfigForClient": func(calls *atomic.Int32) *tls.Config {
+		"GetConfigForClient": func(current *atomic.Pointer[tls.Certificate]) *tls.Config {
 			return &tls.Config{
 				GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
-					calls.Add(1)
-					return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+					return &tls.Config{Certificates: []tls.Certificate{*current.Load()}}, nil
 				},
 			}
 		},
@@ -189,9 +187,11 @@ func TestTLSCertificateReload(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			var calls atomic.Int32
+			var current atomic.Pointer[tls.Certificate]
+			current.Store(&first)
+
 			recorder := newTLSStateRecorder()
-			options := append(recorder.options(), Logger(slogt.New(t)), TLSConfig(config(&calls)))
+			options := append(recorder.options(), Logger(slogt.New(t)), TLSConfig(config(&current)))
 
 			server, err := NewServer(recorder.handle, options...)
 			require.NoError(t, err)
@@ -211,7 +211,24 @@ func TestTLSCertificateReload(t *testing.T) {
 				assert.True(t, state.HandshakeComplete)
 			}
 
-			assert.Equal(t, int32(1), calls.Load())
+			// The certificate is resolved for every connection, so a rotated
+			// certificate is served to new connections.
+			rotations := []struct {
+				cert *tls.Certificate
+				leaf *x509.Certificate
+			}{{&first, firstLeaf}, {&second, secondLeaf}}
+
+			for _, rotation := range rotations {
+				current.Store(rotation.cert)
+				expected := rotation.leaf
+
+				tlsConn := dialTLS(t, address, &tls.Config{InsecureSkipVerify: true})
+				served := tlsConn.ConnectionState().PeerCertificates
+				require.NoError(t, tlsConn.Close())
+
+				require.NotEmpty(t, served)
+				assert.True(t, expected.Equal(served[0]), "server presented %q, expected %q", served[0].Subject.CommonName, expected.Subject.CommonName)
+			}
 		})
 	}
 }
@@ -354,28 +371,37 @@ func TestWrapConn(t *testing.T) {
 	cert, _ := generateTestCertWithUsage(t, "server", x509.ExtKeyUsageServerAuth)
 
 	type wrapped struct {
-		conn  *countingConn
-		isTLS bool
-		state *tls.ConnectionState
-	}
-
-	var mu sync.Mutex
-	conns := make(chan wrapped, 1)
-	wrap := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		_, isTLS := conn.(*tls.Conn)
-		counting := &countingConn{Conn: conn}
-		conns <- wrapped{conn: counting, isTLS: isTLS, state: TLSConnectionState(ctx)}
-		return counting, nil
+		conn       *countingConn
+		isTLS      bool
+		state      *tls.ConnectionState
+		authBefore bool
 	}
 
 	recorder := newTLSStateRecorder()
+	conns := make(chan wrapped, 1)
+	wrap := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		_, isTLS := conn.(*tls.Conn)
+		counting := &countingConn{Conn: conn}
+		conns <- wrapped{
+			conn:       counting,
+			isTLS:      isTLS,
+			state:      TLSConnectionState(ctx),
+			authBefore: len(recorder.auth) > 0,
+		}
+		return counting, nil
+	}
+
+	cancels := make(chan struct{}, 1)
+	cancelRequest := func(ctx context.Context, processID, secretKey int32) error {
+		cancels <- struct{}{}
+		return nil
+	}
+
 	options := append(recorder.options(),
 		Logger(slogt.New(t)),
 		TLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}}),
 		WrapConn(wrap),
+		CancelRequest(cancelRequest),
 	)
 
 	server, err := NewServer(recorder.handle, options...)
@@ -392,6 +418,7 @@ func TestWrapConn(t *testing.T) {
 
 		receive(t, recorder.auth)
 		result := receive(t, conns)
+		assert.False(t, result.authBefore, "connection wrapped after authentication")
 		assert.Eventually(t, result.conn.closed.Load, 5*time.Second, 10*time.Millisecond, "wrapped connection not closed")
 		assert.Positive(t, result.conn.written.Load(), "server did not write through the wrapped connection")
 		return result
@@ -411,6 +438,23 @@ func TestWrapConn(t *testing.T) {
 		result := run(t, conn)
 		assert.False(t, result.isTLS)
 		assert.Nil(t, result.state)
+	})
+
+	t.Run("cancel request", func(t *testing.T) {
+		conn, err := net.Dial("tcp", address.String())
+		require.NoError(t, err)
+		defer conn.Close() //nolint:errcheck
+
+		_, err = conn.Write(cancelRequestMessage(42, 1234))
+		require.NoError(t, err)
+
+		receive(t, cancels)
+		assertClosedWithoutAuth(t, conn)
+		select {
+		case <-conns:
+			t.Fatal("cancel request connection wrapped")
+		default:
+		}
 	})
 }
 
@@ -519,10 +563,10 @@ func TestSSLRequestInjectedPlaintext(t *testing.T) {
 			errs <- err
 		}()
 
+		require.NoError(t, client.SetDeadline(time.Now().Add(5*time.Second)))
 		_, err = client.Write(append(sslRequestMessage(), startupMessage()...))
 		require.NoError(t, err)
 
-		require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
 		received, _ := io.ReadAll(client)
 		require.NoError(t, client.Close())
 

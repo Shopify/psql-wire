@@ -261,6 +261,9 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 		if err != nil {
 			return err
 		}
+		if conn == nil {
+			return errors.New("WrapConn returned a nil connection")
+		}
 		defer conn.Close() //nolint:errcheck
 	}
 
