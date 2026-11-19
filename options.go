@@ -334,7 +334,8 @@ type WrapConnFn func(ctx context.Context, conn net.Conn) (net.Conn, error)
 // is closed once the connection is done, which allows callers to track
 // connections and write messages to clients above the TLS layer, for example
 // a notice before shutting down. Reads keep using the buffered reader created
-// on the negotiated connection. Returning an error closes the connection.
+// on the negotiated connection. Returning an error closes the connection; the
+// returned connection is then ignored, so fn must release anything it set up.
 func WrapConn(fn WrapConnFn) OptionFn {
 	return func(srv *Server) error {
 		srv.WrapConn = fn

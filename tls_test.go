@@ -32,6 +32,7 @@ import (
 type tlsStateRecorder struct {
 	auth    chan *tls.ConnectionState
 	handler chan *tls.ConnectionState
+	authed  atomic.Bool
 }
 
 func newTLSStateRecorder() *tlsStateRecorder {
@@ -43,6 +44,7 @@ func newTLSStateRecorder() *tlsStateRecorder {
 
 func (r *tlsStateRecorder) options() []OptionFn {
 	strategy := func(ctx context.Context, writer *buffer.Writer, reader *buffer.Reader) (context.Context, error) {
+		r.authed.Store(true)
 		r.auth <- TLSConnectionState(ctx)
 		return ctx, writeAuthType(writer, authOK)
 	}
@@ -378,7 +380,9 @@ func TestWrapConn(t *testing.T) {
 	}
 
 	recorder := newTLSStateRecorder()
-	conns := make(chan wrapped, 1)
+	// Buffered beyond a single connection so that a duplicate call fails the
+	// test instead of blocking the server.
+	conns := make(chan wrapped, 4)
 	wrap := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
 		_, isTLS := conn.(*tls.Conn)
 		counting := &countingConn{Conn: conn}
@@ -386,7 +390,7 @@ func TestWrapConn(t *testing.T) {
 			conn:       counting,
 			isTLS:      isTLS,
 			state:      TLSConnectionState(ctx),
-			authBefore: len(recorder.auth) > 0,
+			authBefore: recorder.authed.Load(),
 		}
 		return counting, nil
 	}
@@ -410,6 +414,8 @@ func TestWrapConn(t *testing.T) {
 	address := TListenAndServe(t, server)
 
 	run := func(t *testing.T, conn net.Conn) wrapped {
+		recorder.authed.Store(false)
+
 		client := mock.NewClient(t, conn)
 		client.Handshake(t)
 		client.Authenticate(t)
@@ -419,6 +425,7 @@ func TestWrapConn(t *testing.T) {
 		receive(t, recorder.auth)
 		result := receive(t, conns)
 		assert.False(t, result.authBefore, "connection wrapped after authentication")
+		assert.Empty(t, conns, "connection wrapped more than once")
 		assert.Eventually(t, result.conn.closed.Load, 5*time.Second, 10*time.Millisecond, "wrapped connection not closed")
 		assert.Positive(t, result.conn.written.Load(), "server did not write through the wrapped connection")
 		return result
@@ -555,6 +562,7 @@ func TestSSLRequestInjectedPlaintext(t *testing.T) {
 		// the injected startup message is buffered together with the
 		// SSLRequest.
 		client, conn := net.Pipe()
+		t.Cleanup(func() { _ = client.Close() })
 
 		errs := make(chan error, 1)
 		go func() {
