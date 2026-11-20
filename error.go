@@ -22,6 +22,7 @@ const (
 	errFieldSQLState            errFieldType = 'C'
 	errFieldDetail              errFieldType = 'D'
 	errFieldHint                errFieldType = 'H'
+	errFieldPosition            errFieldType = 'P'
 	errFieldSrcFile             errFieldType = 'F'
 	errFieldSrcLine             errFieldType = 'L'
 	errFieldSrcFunction         errFieldType = 'R'
@@ -63,6 +64,12 @@ func WriteUnterminatedError(writer *buffer.Writer, err error) error {
 	if desc.Detail != "" {
 		writer.AddByte(byte(errFieldDetail))
 		writer.AddString(desc.Detail)
+		writer.AddNullTerminate()
+	}
+
+	if desc.Position > 0 {
+		writer.AddByte(byte(errFieldPosition))
+		writer.AddString(strconv.Itoa(int(desc.Position)))
 		writer.AddNullTerminate()
 	}
 
