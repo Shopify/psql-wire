@@ -38,7 +38,7 @@ func TestEncodeObserverLegacyLimitPublishesEncodedRows(t *testing.T) {
 		} {
 			t.Run(fmt.Sprintf("parallel=%t/%s", parallel, tc.name), func(t *testing.T) {
 				rec := &recordingObserver{}
-				conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
+				conn := compatibilityClient(t, func(context.Context, Query) (PreparedStatements, error) {
 					return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) error {
 						for i := 0; i < 2; i++ {
 							if err := w.Row([]any{"row"}); err != nil {
@@ -71,7 +71,7 @@ func TestEncodeObserverHandlerErrorPublishesEncodedValues(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			rec := &recordingObserver{}
 			handlerErr := errors.New("backend failed")
-			conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
+			conn := compatibilityClient(t, func(context.Context, Query) (PreparedStatements, error) {
 				return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) error {
 					for i := 0; i < 2; i++ {
 						if err := w.Row([]any{"row"}); err != nil {
@@ -91,53 +91,63 @@ func TestEncodeObserverHandlerErrorPublishesEncodedValues(t *testing.T) {
 				f.Send(&pgproto3.Sync{})
 			}
 			require.NoError(t, f.Flush())
-			result := readObserverBatch(t, f)
+			result := readObserverBatch(t, f, false)
 			require.Len(t, result.errors, 1)
 			require.Equal(t, []observerEntry{textObservation(2, 6)}, rec.snapshot())
 		})
 	}
 }
 
+// A suspended portal is torn down either by an explicit Close or, since
+// v0.20, by the idle ReadyForQuery that answers Sync.
 func TestEncodeObserverSuspendedPortalTeardownDoesNotRepublish(t *testing.T) {
 	for _, parallel := range []bool{false, true} {
-		t.Run(fmt.Sprint(parallel), func(t *testing.T) {
-			rec := &recordingObserver{}
-			returned := make(chan error, 1)
-			conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
-				return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) (err error) {
-					defer func() { returned <- err }()
-					for i := 0; i < 3; i++ {
-						if err := w.Row([]any{"row"}); err != nil {
-							return err
+		for _, teardown := range []string{"close", "idle-sync"} {
+			t.Run(fmt.Sprintf("parallel=%t/%s", parallel, teardown), func(t *testing.T) {
+				rec := &recordingObserver{}
+				returned := make(chan error, 1)
+				conn := compatibilityClient(t, func(context.Context, Query) (PreparedStatements, error) {
+					return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) (err error) {
+						defer func() { returned <- err }()
+						for i := 0; i < 3; i++ {
+							if err := w.Row([]any{"row"}); err != nil {
+								return err
+							}
 						}
-					}
-					return w.Complete("SELECT 3")
-				}, WithColumns(Columns{{Name: "value", Oid: pgtype.TextOID}}))), nil
-			}, WithEncodeObserver(rec.observe), ParallelPipeline(ParallelPipelineConfig{Enabled: parallel}))
-			f := conn.Frontend()
-			f.Send(&pgproto3.Parse{Name: "s", Query: "resumable"})
-			f.Send(&pgproto3.Bind{DestinationPortal: "p", PreparedStatement: "s"})
-			f.Send(&pgproto3.Execute{Portal: "p", MaxRows: 1})
-			f.Send(&pgproto3.Sync{})
-			require.NoError(t, f.Flush())
-			suspended := readObserverBatch(t, f)
-			require.Empty(t, suspended.errors)
-			require.Equal(t, []string{"row"}, suspended.rows)
-			require.True(t, suspended.suspended)
-			require.Equal(t, []observerEntry{textObservation(1, 3)}, rec.snapshot())
+						return w.Complete("SELECT 3")
+					}, WithColumns(Columns{{Name: "value", Oid: pgtype.TextOID}}))), nil
+				}, WithEncodeObserver(rec.observe), ParallelPipeline(ParallelPipelineConfig{Enabled: parallel}))
+				f := conn.Frontend()
+				f.Send(&pgproto3.Parse{Name: "s", Query: "resumable"})
+				f.Send(&pgproto3.Bind{DestinationPortal: "p", PreparedStatement: "s"})
+				f.Send(&pgproto3.Execute{Portal: "p", MaxRows: 1})
+				if teardown == "close" {
+					f.Send(&pgproto3.Flush{})
+				} else {
+					f.Send(&pgproto3.Sync{})
+				}
+				require.NoError(t, f.Flush())
+				suspended := readObserverBatch(t, f, teardown == "close")
+				require.Empty(t, suspended.errors)
+				require.Equal(t, []string{"row"}, suspended.rows)
+				require.True(t, suspended.suspended)
 
-			f.Send(&pgproto3.Close{ObjectType: 'P', Name: "p"})
-			f.Send(&pgproto3.Sync{})
-			require.NoError(t, f.Flush())
-			require.Empty(t, readObserverBatch(t, f).errors)
-			select {
-			case err := <-returned:
-				require.ErrorIs(t, err, ErrSuspendedHandlerClosed)
-			case <-time.After(5 * time.Second):
-				t.Fatal("closed portal did not unwind its suspended handler")
-			}
-			require.Equal(t, []observerEntry{textObservation(1, 3)}, rec.snapshot(), "teardown must not republish rows")
-		})
+				if teardown == "close" {
+					require.Equal(t, []observerEntry{textObservation(1, 3)}, rec.snapshot())
+					f.Send(&pgproto3.Close{ObjectType: 'P', Name: "p"})
+					f.Send(&pgproto3.Sync{})
+					require.NoError(t, f.Flush())
+					require.Empty(t, readObserverBatch(t, f, false).errors)
+				}
+				select {
+				case err := <-returned:
+					require.ErrorIs(t, err, ErrSuspendedHandlerClosed)
+				case <-time.After(5 * time.Second):
+					t.Fatal("closed portal did not unwind its suspended handler")
+				}
+				require.Equal(t, []observerEntry{textObservation(1, 3)}, rec.snapshot(), "teardown must not republish rows")
+			})
+		}
 	}
 }
 
@@ -162,7 +172,7 @@ func TestEncodeObserverFormatsFollowNegotiatedColumns(t *testing.T) {
 		} {
 			t.Run(fmt.Sprintf("parallel=%t/formats=%v", parallel, tc.formats), func(t *testing.T) {
 				rec := &recordingObserver{}
-				conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
+				conn := compatibilityClient(t, func(context.Context, Query) (PreparedStatements, error) {
 					return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) error {
 						if err := w.Row([]any{"x", int32(7)}); err != nil {
 							return err
@@ -293,7 +303,9 @@ type observerBatch struct {
 	suspended          bool
 }
 
-func readObserverBatch(t *testing.T, f *pgproto3.Frontend) observerBatch {
+// readObserverBatch reads responses until ReadyForQuery, or until
+// PortalSuspended when untilSuspended is set (after a Flush).
+func readObserverBatch(t *testing.T, f *pgproto3.Frontend, untilSuspended bool) observerBatch {
 	t.Helper()
 	var result observerBatch
 	for {
@@ -304,6 +316,9 @@ func readObserverBatch(t *testing.T, f *pgproto3.Frontend) observerBatch {
 			result.rows = append(result.rows, string(m.Values[0]))
 		case *pgproto3.PortalSuspended:
 			result.suspended = true
+			if untilSuspended {
+				return result
+			}
 		case *pgproto3.CommandComplete:
 			result.tags = append(result.tags, string(m.CommandTag))
 		case *pgproto3.ErrorResponse:

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
 	"github.com/jeroenrinzema/psql-wire/pkg/types"
 )
@@ -71,15 +72,18 @@ func (columns Columns) CopyIn(ctx context.Context, writer *buffer.Writer, format
 // Binary. If you provide a single format code, it will be applied to all
 // columns.
 func (columns Columns) Write(ctx context.Context, formats []FormatCode, writer *buffer.Writer, srcs []any) (err error) {
-	return columns.write(ctx, formats, writer, srcs, EncodeObserverFromContext(ctx), nil)
+	return columns.write(ctx, formats, writer, srcs, TypeMap(ctx), nil, EncodeObserverFromContext(ctx), nil)
 }
 
 // write encodes a DataRow. Encode observations of non-NULL values accumulate
 // in stats when it is set, for the owning dataWriter to publish later;
 // otherwise observer, when set, is called for each value immediately.
-func (columns Columns) write(ctx context.Context, formats []FormatCode, writer *buffer.Writer, srcs []any, observer EncodeObserver, stats []encodeStats) (err error) {
+func (columns Columns) write(ctx context.Context, formats []FormatCode, writer *buffer.Writer, srcs []any, tm *pgtype.Map, scratch *[]byte, observer EncodeObserver, stats []encodeStats) (err error) {
 	if len(srcs) != len(columns) {
 		return fmt.Errorf("unexpected columns, %d columns are defined inside the given table but %d were given", len(columns), len(srcs))
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	writer.Start(types.ServerDataRow)
@@ -99,7 +103,7 @@ func (columns Columns) write(ctx context.Context, formats []FormatCode, writer *
 		if len(stats) > index {
 			stat = &stats[index]
 		}
-		err = column.write(ctx, writer, format, srcs[index], observer, stat)
+		err = column.write(ctx, writer, format, srcs[index], tm, scratch, observer, stat)
 		if err != nil {
 			return err
 		}
@@ -158,20 +162,21 @@ func (column Column) Define(ctx context.Context, writer *buffer.Writer, format F
 //
 // [DataRow]: https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-DATAROW
 func (column Column) Write(ctx context.Context, writer *buffer.Writer, format FormatCode, src any) (err error) {
-	return column.write(ctx, writer, format, src, EncodeObserverFromContext(ctx), nil)
-}
-
-func (column Column) write(ctx context.Context, writer *buffer.Writer, format FormatCode, src any, observer EncodeObserver, stat *encodeStats) (err error) {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	return column.write(ctx, writer, format, src, TypeMap(ctx), nil, EncodeObserverFromContext(ctx), nil)
+}
 
-	tm := TypeMap(ctx)
+func (column Column) write(ctx context.Context, writer *buffer.Writer, format FormatCode, src any, tm *pgtype.Map, scratch *[]byte, observer EncodeObserver, stat *encodeStats) (err error) {
 	if tm == nil {
 		return errors.New("postgres connection info has not been defined inside the given context")
 	}
 
 	bb := make([]byte, 0)
+	if scratch != nil && *scratch != nil {
+		bb = (*scratch)[:0]
+	}
 	bb, err = tm.Encode(uint32(column.Oid), int16(format), src, bb)
 	if err != nil {
 		return err
@@ -194,6 +199,16 @@ func (column Column) write(ctx context.Context, writer *buffer.Writer, format Fo
 			stat.encodedBytes += uint64(len(bb))
 		} else if observer != nil {
 			observer(ctx, format, column.Oid, 1, uint64(len(bb)))
+		}
+	}
+
+	// AddBytes copies the value into the frame before scratch is reused. A
+	// NULL must not discard a previously allocated buffer.
+	if scratch != nil && bb != nil {
+		if cap(bb) <= maxEncodeScratchCapacity {
+			*scratch = bb[:0]
+		} else {
+			*scratch = nil
 		}
 	}
 

@@ -17,7 +17,7 @@ func TestLegacyExecuteLimitUnwindsHandler(t *testing.T) {
 	for _, parallel := range []bool{false, true} {
 		t.Run(fmt.Sprint(parallel), func(t *testing.T) {
 			returned := make(chan struct{})
-			conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
+			conn := compatibilityClient(t, func(context.Context, Query) (PreparedStatements, error) {
 				return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) error {
 					defer close(returned)
 					for i := 0; i < 2; i++ {
@@ -60,7 +60,7 @@ func TestCompatibilityBindDescribeErrorRecovery(t *testing.T) {
 		&pgproto3.Describe{ObjectType: 'P', Name: "cache-error"},
 	} {
 		t.Run(fmt.Sprintf("%T/%v", message, message), func(t *testing.T) {
-			conn := compatibilityClient(t, func(context.Context, string) (PreparedStatements, error) {
+			conn := compatibilityClient(t, func(context.Context, Query) (PreparedStatements, error) {
 				return Prepared(NewStatement(func(context.Context, DataWriter, []Parameter) error { return nil })), nil
 			}, Statements(func() StatementCache { return &failingLookupCache{DefaultStatementCacheFn()} }),
 				Portals(func() PortalCache { return &failingPortalCache{DefaultPortalCacheFn()} }))
@@ -92,9 +92,9 @@ func TestParallelResponseOrderUsesPortalIdentity(t *testing.T) {
 	secondFinished := make(chan struct{})
 	abort := make(chan struct{})
 	defer close(abort) // release A before server cleanup if B never starts
-	conn := compatibilityClient(t, func(_ context.Context, query string) (PreparedStatements, error) {
+	conn := compatibilityClient(t, func(_ context.Context, query Query) (PreparedStatements, error) {
 		return Prepared(NewStatement(func(_ context.Context, w DataWriter, _ []Parameter) error {
-			if query == "A" {
+			if query.Query == "A" {
 				select {
 				case <-secondFinished:
 				case <-abort:
@@ -103,7 +103,7 @@ func TestParallelResponseOrderUsesPortalIdentity(t *testing.T) {
 			} else {
 				defer close(secondFinished)
 			}
-			if err := w.Row([]any{query}); err != nil {
+			if err := w.Row([]any{query.Query}); err != nil {
 				return err
 			}
 			return w.Complete("SELECT 1")

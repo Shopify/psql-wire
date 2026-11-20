@@ -52,7 +52,7 @@ func (r *recordingObserver) snapshot() []observerEntry {
 func twoColumnTestServer(t *testing.T, opts ...OptionFn) *Server {
 	t.Helper()
 
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+	handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
 		fn := func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
 			require.NoError(t, writer.Row([]any{"alice", int32(30)}))
 			require.NoError(t, writer.Row([]any{"bob", int32(25)}))
@@ -272,7 +272,7 @@ func TestEncodeObserverSkipsNullValues(t *testing.T) {
 
 	rec := &recordingObserver{}
 
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+	handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
 		fn := func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
 			require.NoError(t, writer.Row([]any{"alice", nil}))
 			return writer.Complete("SELECT 1")
@@ -317,7 +317,7 @@ func TestDataWriterFormats(t *testing.T) {
 	var captured []FormatCode
 	var captureOnce sync.Once
 
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+	handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
 		fn := func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
 			captureOnce.Do(func() {
 				captured = append(captured, writer.Formats()...)

@@ -9,19 +9,25 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jeroenrinzema/psql-wire/pkg/types"
 	"github.com/neilotoole/slogt"
 	"github.com/stretchr/testify/require"
 )
 
-// Exercise the public Execute/Sync boundary: a resumed parallel portal must
-// write into this Execute's response buffer, not the buffer already replayed.
+// Exercise the public Execute boundary: a resumed parallel portal must write
+// into this Execute's response buffer, not the buffer already replayed. A
+// portal can be resumed after a Flush, or after a Sync while a transaction
+// block keeps it open (an idle Sync closes every portal).
 // Encode observations are published at each Execute boundary: once when the
 // portal suspends and once when it completes, each covering only its rows.
 func TestPipelineSuspensionPreservesRowsAndObservation(t *testing.T) {
-	for _, parallel := range []bool{false, true} {
-		t.Run(fmt.Sprint(parallel), func(t *testing.T) {
+	for _, tc := range []struct {
+		parallel    bool
+		transaction bool
+	}{{false, false}, {true, false}, {false, true}, {true, true}} {
+		t.Run(fmt.Sprintf("parallel=%t/transaction=%t", tc.parallel, tc.transaction), func(t *testing.T) {
 			rec := &recordingObserver{}
-			handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+			handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
 				return Prepared(NewStatement(func(ctx context.Context, w DataWriter, _ []Parameter) error {
 					if len(w.Formats()) != 1 || w.Formats()[0] != BinaryFormat {
 						return fmt.Errorf("negotiated formats lost: %v", w.Formats())
@@ -34,7 +40,11 @@ func TestPipelineSuspensionPreservesRowsAndObservation(t *testing.T) {
 					return w.Complete("SELECT 5")
 				}, WithColumns(Columns{{Name: "id", Oid: pgtype.Int4OID}}))), nil
 			}
-			server, err := NewServer(handler, Logger(slogt.New(t)), WithEncodeObserver(rec.observe), ParallelPipeline(ParallelPipelineConfig{Enabled: parallel}))
+			options := []OptionFn{Logger(slogt.New(t)), WithEncodeObserver(rec.observe), ParallelPipeline(ParallelPipelineConfig{Enabled: tc.parallel})}
+			if tc.transaction {
+				options = append(options, TxStatus(func(context.Context) types.ServerStatus { return types.ServerTransactionBlock }))
+			}
+			server, err := NewServer(handler, options...)
 			require.NoError(t, err)
 			addr := TListenAndServe(t, server)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -48,7 +58,12 @@ func TestPipelineSuspensionPreservesRowsAndObservation(t *testing.T) {
 			f.Send(&pgproto3.Bind{DestinationPortal: "p", PreparedStatement: "s", ResultFormatCodes: []int16{1}})
 			for cycle, limit := range []uint32{2, 10} {
 				f.Send(&pgproto3.Execute{Portal: "p", MaxRows: limit})
-				f.Send(&pgproto3.Sync{})
+				resumeAfterFlush := cycle == 0 && !tc.transaction
+				if resumeAfterFlush {
+					f.Send(&pgproto3.Flush{})
+				} else {
+					f.Send(&pgproto3.Sync{})
+				}
 				require.NoError(t, f.Flush())
 				var rows [][]byte
 				var suspended bool
@@ -63,6 +78,9 @@ func TestPipelineSuspensionPreservesRowsAndObservation(t *testing.T) {
 						rows = append(rows, append([]byte(nil), m.Values[0]...))
 					case *pgproto3.PortalSuspended:
 						suspended = true
+						if resumeAfterFlush {
+							break read
+						}
 					case *pgproto3.CommandComplete:
 						tag = string(m.CommandTag)
 					case *pgproto3.ErrorResponse:
