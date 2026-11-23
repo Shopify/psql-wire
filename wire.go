@@ -133,6 +133,7 @@ type Server struct {
 	Parameters       Parameters
 	TLSConfig        *tls.Config
 	ClientAuth       tls.ClientAuthType
+	WrapConn         WrapConnFn
 	parse            ParseFn
 	Session          SessionHandler
 	Statements       func() StatementCache
@@ -140,8 +141,10 @@ type Server struct {
 	CloseConn        CloseFn
 	TerminateConn    CloseFn
 	FlushConn        FlushFn
+	SyncConn         SyncFn
 	ParallelPipeline ParallelPipelineConfig
 	ErrorSanitizer   func(error) error
+	TxStatus         TxStatusFn
 	Version          string
 	ShutdownTimeout  time.Duration
 	typeExtension    func(*pgtype.Map)
@@ -248,11 +251,44 @@ func (srv *Server) serve(ctx context.Context, conn net.Conn) error {
 		return conn.Close()
 	}
 
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		state := tlsConn.ConnectionState()
+		ctx = setTLSConnectionState(ctx, &state)
+	}
+
+	if srv.WrapConn != nil {
+		conn, err = srv.WrapConn(ctx, conn)
+		if err != nil {
+			return err
+		}
+		if conn == nil {
+			return errors.New("WrapConn returned a nil connection")
+		}
+		defer conn.Close() //nolint:errcheck
+	}
+
 	srv.logger.Debug("handshake successful, validating authentication")
 
 	writer := buffer.NewWriter(srv.logger, conn)
 	writer.ErrorSanitizer = srv.ErrorSanitizer
-	ctx, err = srv.readClientParameters(ctx, reader)
+
+	// A differing major protocol version cannot be negotiated down, so reject
+	// it before consuming the rest of the startup packet. Only the minor
+	// version is negotiable (handled below).
+	err = srv.checkProtocolVersion(writer, version)
+	if err != nil {
+		return err
+	}
+
+	ctx, unrecognizedOptions, err := srv.readClientParameters(ctx, reader)
+	if err != nil {
+		return err
+	}
+
+	// A NegotiateProtocolVersion message must be sent (when applicable) after
+	// the startup packet has been consumed but before the authentication
+	// request, matching the message ordering used by the PostgreSQL backend.
+	err = srv.writeProtocolVersionNegotiation(writer, version, unrecognizedOptions)
 	if err != nil {
 		return err
 	}

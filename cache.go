@@ -7,6 +7,8 @@ import (
 	"iter"
 	"sync"
 
+	"github.com/jeroenrinzema/psql-wire/codes"
+	psqlerr "github.com/jeroenrinzema/psql-wire/errors"
 	"github.com/jeroenrinzema/psql-wire/pkg/buffer"
 	"github.com/jeroenrinzema/psql-wire/pkg/types"
 )
@@ -152,6 +154,9 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 		// This is the first execute call on this portal. So let's start the
 		// execution. Otherwise we continue from where we left off.
 		session, _ := GetSession(ctx)
+		// Batching depends on the client's MaxRows, not on the internal
+		// limit below: a finite Execute must keep per-row limit checks.
+		clientLimit := limit
 		legacyLimit := NoLimit
 		if session != nil && session.Server != nil && session.disablePortalSuspension {
 			legacyLimit = limit
@@ -170,6 +175,9 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 				yield:   yield,
 				tag:     &p.tag,
 				limit:   legacyLimit,
+				// A first unlimited Execute drains the handler in this call;
+				// no later Execute can impose a limit on remaining rows.
+				batchable: clientLimit == NoLimit,
 			}
 			dw.observeEncoding()
 			p.writer = dw
@@ -250,8 +258,8 @@ func (cache *DefaultPortalCache) Bind(ctx context.Context, name string, stmt *St
 }
 
 func (cache *DefaultPortalCache) Get(ctx context.Context, name string) (*Portal, error) {
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
 
 	if cache.portals == nil {
 		return nil, nil
@@ -273,22 +281,22 @@ func (cache *DefaultPortalCache) Execute(ctx context.Context, name string, limit
 		}
 	}()
 
-	// Look up the portal under the lock, then release before executing.
-	// The handler may call back into the cache so we must make sure we don't
-	// hold the lock for the execute duration. e.g. a handler for DEALLOCATE
-	// may call back into the cache to delete a portal.
-	cache.mu.RLock()
-	if cache.portals == nil {
-		cache.mu.RUnlock()
-		return nil
+	portal, err := cache.Get(ctx, name)
+	if err != nil {
+		return err
+	}
+	if portal == nil {
+		// Match real PostgreSQL: Execute on a non-existent portal is an
+		// error, not a silent no-op.
+		return psqlerr.WithCode(fmt.Errorf("portal %q does not exist", name), codes.InvalidCursorName)
 	}
 
-	portal, has := cache.portals[name]
-	cache.mu.RUnlock()
-	if !has {
-		return nil
-	}
-
+	// When accessesing and changing the fields of the cache cache we hold the
+	// required locks. But we make sure not to hold them during the execute
+	// call itself. This is needed because the handler may call back into the
+	// cache so we must make sure we don't hold the lock for the execute
+	// duration. e.g. a handler for DEALLOCATE may call back into the cache to
+	// delete a portal.
 	cache.mu.Lock()
 	cache.executing = portal
 	cache.mu.Unlock()

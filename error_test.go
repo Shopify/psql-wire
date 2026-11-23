@@ -6,9 +6,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jeroenrinzema/psql-wire/codes"
 	psqlerr "github.com/jeroenrinzema/psql-wire/errors"
@@ -21,7 +24,7 @@ import (
 )
 
 func TestErrorCode(t *testing.T) {
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+	handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
 		stmt := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
 			return psqlerr.WithSeverity(psqlerr.WithCode(errors.New("unimplemented feature"), codes.FeatureNotSupported), psqlerr.LevelFatal)
 		})
@@ -70,8 +73,8 @@ func TestErrorCode(t *testing.T) {
 func TestExtendedQueryParseErrorRecovery(t *testing.T) {
 	t.Parallel()
 
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
-		if query == "SELECT error" {
+	handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
+		if query.Query == "SELECT error" {
 			return nil, psqlerr.WithCode(errors.New("test error"), codes.Syntax)
 		}
 
@@ -119,10 +122,10 @@ func TestExtendedQueryParseErrorRecovery(t *testing.T) {
 func TestExtendedQueryExecuteErrorRecovery(t *testing.T) {
 	t.Parallel()
 
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+	handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
 		columns := Columns{{Name: "result", Oid: 25}} // text
 
-		if query == "SELECT error" {
+		if query.Query == "SELECT error" {
 			stmt := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
 				return psqlerr.WithCode(errors.New("execution failed"), codes.DataException)
 			}, WithColumns(columns))
@@ -174,7 +177,7 @@ func TestSessionErrorCode(t *testing.T) {
 			Portals:    &DefaultPortalCache{},
 		}
 
-		err := session.WriteError(writer, psqlerr.WithCode(errors.New("some error"), codes.Syntax))
+		err := session.WriteError(context.Background(), writer, psqlerr.WithCode(errors.New("some error"), codes.Syntax))
 		assert.NoError(t, err)
 
 		reader := buffer.NewReader(logger, sink, buffer.DefaultBufferSize)
@@ -200,7 +203,7 @@ func TestSessionErrorCode(t *testing.T) {
 			inExtendedQuery: true,
 		}
 
-		err := session.WriteError(writer, psqlerr.WithCode(errors.New("some error"), codes.Syntax))
+		err := session.WriteError(context.Background(), writer, psqlerr.WithCode(errors.New("some error"), codes.Syntax))
 		assert.NoError(t, err)
 		assert.True(t, session.discardUntilSync)
 
@@ -227,7 +230,7 @@ func TestSessionErrorCode(t *testing.T) {
 		}
 
 		inputErr := psqlerr.WithSeverity(psqlerr.WithCode(errors.New("invalid username/password"), codes.InvalidPassword), psqlerr.LevelFatal)
-		err := session.WriteError(writer, inputErr)
+		err := session.WriteError(context.Background(), writer, inputErr)
 		assert.ErrorIs(t, err, inputErr)
 
 		reader := buffer.NewReader(logger, sink, buffer.DefaultBufferSize)
@@ -253,7 +256,7 @@ func TestSessionErrorCode(t *testing.T) {
 		}
 
 		inputErr := psqlerr.WithSeverity(psqlerr.WithCode(errors.New("fatal failure"), codes.FeatureNotSupported), psqlerr.LevelFatal)
-		err := session.WriteError(writer, inputErr)
+		err := session.WriteError(context.Background(), writer, inputErr)
 		assert.ErrorIs(t, err, inputErr)
 		assert.False(t, session.discardUntilSync)
 
@@ -266,6 +269,32 @@ func TestSessionErrorCode(t *testing.T) {
 		_, _, err = reader.ReadTypedMsg()
 		assert.Error(t, err)
 	})
+
+	t.Run("passes ctx to TxStatus when sending ReadyForQuery", func(t *testing.T) {
+		logger := slogt.New(t)
+		sink := bytes.NewBuffer([]byte{})
+		writer := buffer.NewWriter(logger, sink)
+
+		type ctxKey struct{}
+		var seen context.Context
+		session := &Session{
+			Server: &Server{
+				logger: logger,
+				TxStatus: func(ctx context.Context) types.ServerStatus {
+					seen = ctx
+					return types.ServerIdle
+				},
+			},
+			Statements: &DefaultStatementCache{},
+			Portals:    &DefaultPortalCache{},
+		}
+
+		ctx := context.WithValue(context.Background(), ctxKey{}, "marker")
+		err := session.WriteError(ctx, writer, psqlerr.WithCode(errors.New("boom"), codes.Syntax))
+		require.NoError(t, err)
+		require.NotNil(t, seen, "TxStatus callback was not invoked")
+		assert.Equal(t, "marker", seen.Value(ctxKey{}), "TxStatus received a different ctx than the one passed to WriteError")
+	})
 }
 
 func TestDiscardUntilSync(t *testing.T) {
@@ -276,7 +305,7 @@ func TestDiscardUntilSync(t *testing.T) {
 	ctx = setTypeInfo(ctx, typeMap)
 	logger := slogt.New(t)
 
-	mockParse := func(ctx context.Context, query string) (PreparedStatements, error) {
+	mockParse := func(ctx context.Context, query Query) (PreparedStatements, error) {
 		stmt := NewStatement(
 			func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
 				return errors.New("query failed")
@@ -367,7 +396,7 @@ func TestRowReturnsEncodeError(t *testing.T) {
 
 	var rowErr error
 
-	handler := func(ctx context.Context, query string) (PreparedStatements, error) {
+	handler := func(ctx context.Context, query Query) (PreparedStatements, error) {
 		columns := Columns{{Name: "val", Oid: pgtype.Int4OID}}
 
 		stmt := NewStatement(func(ctx context.Context, writer DataWriter, parameters []Parameter) error {
@@ -400,4 +429,104 @@ func TestRowReturnsEncodeError(t *testing.T) {
 
 	err = conn.Close(ctx)
 	assert.NoError(t, err)
+}
+
+func TestErrorResponseFields(t *testing.T) {
+	t.Parallel()
+
+	for _, line := range []int32{0, 123, math.MaxInt32} {
+		t.Run(fmt.Sprintf("line_%d", line), func(t *testing.T) {
+			t.Parallel()
+
+			err := psqlerr.WithCode(errors.New("duplicate key"), codes.UniqueViolation)
+			err = psqlerr.WithDetail(err, "Key already exists.")
+			err = psqlerr.WithHint(err, "Choose a different key.")
+			err = psqlerr.WithConstraintName(err, "items_pkey")
+			err = psqlerr.WithSource(err, "constraints.go", line, "checkUnique")
+			err = psqlerr.WithPosition(err, 42)
+
+			var sink bytes.Buffer
+			writer := buffer.NewWriter(slogt.New(t), &sink)
+			require.NoError(t, WriteUnterminatedError(writer, err))
+
+			// Decode the complete frame as a client would, including its length.
+			client := pgproto3.NewFrontend(&sink, io.Discard)
+			message, decodeErr := client.Receive()
+			require.NoError(t, decodeErr)
+			require.Equal(t, &pgproto3.ErrorResponse{
+				Severity:            "ERROR",
+				SeverityUnlocalized: "ERROR",
+				Code:                "23505",
+				Message:             "duplicate key",
+				Detail:              "Key already exists.",
+				Hint:                "Choose a different key.",
+				Position:            42,
+				ConstraintName:      "items_pkey",
+				File:                "constraints.go",
+				Line:                line,
+				Routine:             "checkUnique",
+			}, message)
+		})
+	}
+}
+
+func TestErrorResponseOptionalFields(t *testing.T) {
+	t.Parallel()
+
+	for _, sanitize := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sanitize_%t", sanitize), func(t *testing.T) {
+			t.Parallel()
+
+			publicErr := psqlerr.WithCode(errors.New("request failed"), codes.Internal)
+			inputErr := publicErr
+			var sink bytes.Buffer
+			writer := buffer.NewWriter(slogt.New(t), &sink)
+			if sanitize {
+				inputErr = psqlerr.WithSource(inputErr, "private.go", 123, "privateRoutine")
+				inputErr = psqlerr.WithConstraintName(inputErr, "private_constraint")
+				inputErr = psqlerr.WithPosition(inputErr, 42)
+				writer.ErrorSanitizer = func(error) error { return publicErr }
+			}
+			require.NoError(t, WriteUnterminatedError(writer, inputErr))
+			// None of the public field values contain P, so its absence also
+			// verifies that position was omitted rather than encoded as zero.
+			require.NotContains(t, sink.Bytes()[5:], byte('P'))
+			message, err := pgproto3.NewFrontend(&sink, io.Discard).Receive()
+			require.NoError(t, err)
+			require.Equal(t, &pgproto3.ErrorResponse{
+				Severity:            "ERROR",
+				SeverityUnlocalized: "ERROR",
+				Code:                "XX000",
+				Message:             "request failed",
+			}, message)
+		})
+	}
+}
+
+func TestErrorResponsePosition(t *testing.T) {
+	t.Parallel()
+
+	for _, position := range []int32{-1, 0, 1, 123, math.MaxInt32} {
+		t.Run(fmt.Sprintf("position_%d", position), func(t *testing.T) {
+			t.Parallel()
+
+			err := psqlerr.WithPosition(psqlerr.WithCode(errors.New("syntax error"), codes.Syntax), position)
+			var sink bytes.Buffer
+			writer := buffer.NewWriter(slogt.New(t), &sink)
+			require.NoError(t, WriteUnterminatedError(writer, err))
+			if position <= 0 {
+				// The remaining field values contain no P bytes.
+				require.NotContains(t, sink.Bytes()[5:], byte('P'))
+			}
+			message, decodeErr := pgproto3.NewFrontend(&sink, io.Discard).Receive()
+			require.NoError(t, decodeErr)
+			require.Equal(t, &pgproto3.ErrorResponse{
+				Severity:            "ERROR",
+				SeverityUnlocalized: "ERROR",
+				Code:                "42601",
+				Message:             "syntax error",
+				Position:            max(position, 0),
+			}, message)
+		})
+	}
 }
